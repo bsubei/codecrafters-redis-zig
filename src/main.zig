@@ -5,7 +5,7 @@ pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
 
     // You can use print statements as follows for debugging, they'll be visible when running tests.
-    try stdout.print("Logs from your program will appear here!", .{});
+    try stdout.print("Logs from your program will appear here!\n", .{});
 
     const address = try net.Address.resolveIp("127.0.0.1", 6379);
 
@@ -16,8 +16,10 @@ pub fn main() !void {
 
     while (true) {
         const connection = try listener.accept();
+        defer connection.stream.close();
+        try stdout.print("accepted new connection from client {}\n", .{connection.address.in});
 
-        try stdout.print("accepted new connection", .{});
-        connection.stream.close();
+        try connection.stream.writeAll("+PONG\r\n");
+        try stdout.print("Done with client {}\n", .{connection.address.in});
     }
 }
