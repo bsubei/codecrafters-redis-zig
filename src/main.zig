@@ -14,12 +14,13 @@ pub fn main() !void {
     });
     defer listener.deinit();
 
-    while (true) {
-        const connection = try listener.accept();
-        defer connection.stream.close();
-        try stdout.print("accepted new connection from client {}\n", .{connection.address.in});
+    const connection = try listener.accept();
+    try stdout.print("accepted new connection from client {}\n", .{connection.address.in});
+    defer connection.stream.close();
 
+    var buf: [1024]u8 = undefined;
+    while ((connection.stream.read(&buf) catch 0) > 0) {
         try connection.stream.writeAll("+PONG\r\n");
-        try stdout.print("Done with client {}\n", .{connection.address.in});
+        try stdout.print("Done sending to client {}\n", .{connection.address.in});
     }
 }
