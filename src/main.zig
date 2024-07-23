@@ -2,6 +2,27 @@ const std = @import("std");
 const net = std.net;
 const stdout = std.io.getStdOut().writer();
 
+// Bytes coming in from the client socket are first parsed as a Message, which is then further interpreted as a
+// Request. The Request is handled and a Response is produced. Finally, the Response is converted into a Message,
+// which is then sent back to the client over the socket as a sequence of bytes.
+const SimpleString = []const u8;
+const BulkString = []const u8;
+const Array = struct { length: u32, elements: std.ArrayList([]const u8) };
+const Message = union(enum) {
+    simple_string: SimpleString,
+    bulk_string: BulkString,
+    array: Array,
+};
+
+// Messages from the client are parsed as one of these Requests, which are then processed to produce a Response.
+// TODO Ping could have no attached message.
+const PingCommand = []const u8;
+const EchoCommand = []const u8;
+const Request = union(enum) {
+    ping: PingCommand,
+    echo: EchoCommand,
+};
+
 // The server produces and sends a Response back to the client.
 const Response = []const u8;
 
