@@ -2,9 +2,35 @@ const std = @import("std");
 const net = std.net;
 const stdout = std.io.getStdOut().writer();
 
+// The server produces and sends a Response back to the client.
+const Response = []const u8;
+
+// TODO implement proper parsing. For now, we're just assuming the structure of incoming messages look like this:
+// *2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n
+fn get_response(request: []const u8) !Response {
+    var it = std.mem.tokenizeSequence(u8, request, "\r\n");
+    var i: usize = 0;
+    var command_index: ?usize = undefined;
+    while (it.next()) |word| : (i += 1) {
+        if (command_index) |index| if (i == index + 2) {
+            var buf: [1024]u8 = undefined;
+            return try std.fmt.bufPrint(&buf, "+{s}\r\n", .{word});
+        };
+        if (std.ascii.eqlIgnoreCase(word, "echo")) {
+            command_index = i;
+        }
+        if (std.ascii.eqlIgnoreCase(word, "ping")) {
+            return "+PONG\r\n";
+        }
+    }
+    // TODO reply with OK if we don't understand. This is necessary for now because "redis-cli" sometimes sends the COMMANDS command which we don't understand.
+    return "+OK\r\n";
+}
+
 fn handleClient(client_connection: net.Server.Connection) !void {
     defer client_connection.stream.close();
 
+    // TODO handle more than 1024 bytes at a time.
     var buf: [1024]u8 = undefined;
     while (true) {
         const num_read_bytes = client_connection.stream.read(&buf) catch break;
@@ -12,7 +38,7 @@ fn handleClient(client_connection: net.Server.Connection) !void {
         if (num_read_bytes == 0) {
             break;
         }
-        const response = "+PONG\r\n";
+        const response = try get_response(&buf);
         try client_connection.stream.writeAll(response);
         try stdout.print("Done sending response: {s} to client {}\n", .{ response, client_connection.address.in });
     }
