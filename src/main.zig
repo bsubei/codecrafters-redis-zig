@@ -20,13 +20,17 @@ const Message = union(enum) {
 const PingCommand = struct { index: u32 };
 const EchoCommand = struct { index: u32 };
 // Even though the set command takes two args, we only need to store one arg because we're done as soon as we see the second arg.
-const SetCommand = struct { index: u32, arg: ?[]const u8 };
+const SetCommand = struct { index: u32, key: ?[]const u8, value: ?[]const u8, expiry: ?[]const u8 };
 const GetCommand = struct { index: u32 };
 const Request = union(enum) {
     ping: PingCommand,
     echo: EchoCommand,
     set: SetCommand,
     get: GetCommand,
+};
+
+const Error = error{
+    MissingExpiryArgument,
 };
 
 // The server produces and sends a Response back to the client.
@@ -51,12 +55,32 @@ fn get_response(request: []const u8, cache: *Cache) !Response {
                 .set => |set| {
                     if (i == set.index + 2) {
                         // Record the requested KEY
-                        // TODO do we need a memcpy here?
-                        command.?.set.arg = word;
+                        // NOTE: this is ok since word is a slice originating from the "request" slice. Its lifetime should be the lifetime of this function.
+                        command.?.set.key = word;
+                        continue;
                     } else if (i == set.index + 4) {
-                        // Store the key-value into the cache.
-                        // TODO this is wrong, we need to make copies. Right now it's just reusing the memory locations of these vars on the stack.
-                        try cache.put(set.arg.?, word);
+                        // Record the requested VALUE
+                        command.?.set.value = word;
+                        continue;
+                    } else if (i == set.index + 6) {
+                        // Check for an expiry argument.
+                        if (std.ascii.eqlIgnoreCase(word, "px")) {
+                            command.?.set.expiry = word;
+                            continue;
+                        }
+                        // Store the key-value without an expiry.
+                        try cache.put(set.key.?, set.value.?);
+                        return "+OK\r\n";
+                    } else if (i == set.index + 8) {
+                        // Store the key-value with an expiry.
+                        if (set.expiry) |_| {
+                            // TODO Finish defining putWithExpiry and converting expiry string to timestamp.
+                            // try cache.putWithExpiry(set.key.?, set.value.?, word);
+                            try stdout.print("EXPIRY: {s}\n", .{word});
+                            try cache.put(set.key.?, set.value.?);
+                        } else {
+                            return Error.MissingExpiryArgument;
+                        }
                         return "+OK\r\n";
                     }
                 },
@@ -84,7 +108,7 @@ fn get_response(request: []const u8, cache: *Cache) !Response {
         }
         if (std.ascii.eqlIgnoreCase(word, "set")) {
             // We know it's a set command, but we don't know the args yet.
-            command = .{ .set = SetCommand{ .index = i, .arg = null } };
+            command = .{ .set = SetCommand{ .index = i, .key = null, .value = null, .expiry = null } };
             continue;
         }
         if (std.ascii.eqlIgnoreCase(word, "get")) {
