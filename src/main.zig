@@ -6,8 +6,9 @@ const Cache = @import("RwLockHashMap.zig").RwLockHashMap;
 // Bytes coming in from the client socket are first parsed as a Message, which is then further interpreted as a
 // Request. The Request is handled and a Response is produced. Finally, the Response is converted into a Message,
 // which is then sent back to the client over the socket as a sequence of bytes.
-const SimpleString = []const u8;
-const BulkString = []const u8;
+// NOTE: we have to make these into wrapper classes because otherwise these String types would be aliases to []const u8, and then we can't distinguish between the two in the tagged union.
+const SimpleString = struct { value: []const u8 };
+const BulkString = struct { value: []const u8 };
 const Array = struct { length: u32, elements: std.ArrayList([]const u8) };
 const Message = union(enum) {
     simple_string: SimpleString,
@@ -16,14 +17,16 @@ const Message = union(enum) {
 };
 
 // Messages from the client are parsed as one of these Requests, which are then processed to produce a Response.
-const PingCommand = struct { index: u32, arg: ?[]const u8 };
-const EchoCommand = struct { index: u32, arg: ?[]const u8 };
+const PingCommand = struct { index: u32 };
+const EchoCommand = struct { index: u32 };
 // Even though the set command takes two args, we only need to store one arg because we're done as soon as we see the second arg.
 const SetCommand = struct { index: u32, arg: ?[]const u8 };
+const GetCommand = struct { index: u32 };
 const Request = union(enum) {
     ping: PingCommand,
     echo: EchoCommand,
     set: SetCommand,
+    get: GetCommand,
 };
 
 // The server produces and sends a Response back to the client.
@@ -57,12 +60,22 @@ fn get_response(request: []const u8, cache: *Cache) !Response {
                         return "+OK\r\n";
                     }
                 },
+                .get => |get| {
+                    if (i == get.index + 2) {
+                        const value = cache.get(word);
+                        if (value) |val| {
+                            var buf: [1024]u8 = undefined;
+                            return try std.fmt.bufPrint(&buf, "${d}\r\n{s}\r\n", .{ val.len, val });
+                        }
+                        return "$-1\r\n";
+                    }
+                },
                 else => {},
             }
         }
         if (std.ascii.eqlIgnoreCase(word, "echo")) {
             // We know it's an echo command, but we don't know the arg yet.
-            command = .{ .echo = EchoCommand{ .index = i, .arg = null } };
+            command = .{ .echo = EchoCommand{ .index = i } };
             continue;
         }
         if (std.ascii.eqlIgnoreCase(word, "ping")) {
@@ -72,6 +85,11 @@ fn get_response(request: []const u8, cache: *Cache) !Response {
         if (std.ascii.eqlIgnoreCase(word, "set")) {
             // We know it's a set command, but we don't know the args yet.
             command = .{ .set = SetCommand{ .index = i, .arg = null } };
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(word, "get")) {
+            // We know it's a get command, but we don't know the arg yet.
+            command = .{ .get = GetCommand{ .index = i } };
             continue;
         }
     }
