@@ -37,7 +37,7 @@ const Error = error{
 const Response = []const u8;
 // TODO implement proper parsing. For now, we're just assuming the structure of incoming messages look like this:
 // *2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n
-fn get_response(request: []const u8, cache: *Cache) !Response {
+fn get_response(allocator: std.mem.Allocator, request: []const u8, cache: *Cache) !Response {
     var it = std.mem.tokenizeSequence(u8, request, "\r\n");
     var i: u32 = 0;
 
@@ -48,8 +48,8 @@ fn get_response(request: []const u8, cache: *Cache) !Response {
             switch (cmd) {
                 .echo => |echo| {
                     if (i == echo.index + 2) {
-                        var buf: [1024]u8 = undefined;
-                        return try std.fmt.bufPrint(&buf, "+{s}\r\n", .{word});
+                        const buf = try allocator.alloc(u8, word.len + 3);
+                        return try std.fmt.bufPrint(buf, "+{s}\r\n", .{word});
                     }
                 },
                 .set => |set| {
@@ -70,7 +70,9 @@ fn get_response(request: []const u8, cache: *Cache) !Response {
                         }
                         // Store the key-value without an expiry.
                         try cache.put(set.key.?, set.value.?);
-                        return "+OK\r\n";
+                        const buf = try allocator.alloc(u8, 5);
+                        std.mem.copyForwards(u8, buf, "+OK\r\n");
+                        return buf;
                     } else if (i == set.index + 8) {
                         // Store the key-value with an expiry.
                         if (set.expiry) |_| {
@@ -81,17 +83,22 @@ fn get_response(request: []const u8, cache: *Cache) !Response {
                         } else {
                             return Error.MissingExpiryArgument;
                         }
-                        return "+OK\r\n";
+                        // TODO create a make_response function to make this less ugly.
+                        const buf = try allocator.alloc(u8, 5);
+                        std.mem.copyForwards(u8, buf, "+OK\r\n");
+                        return buf;
                     }
                 },
                 .get => |get| {
                     if (i == get.index + 2) {
                         const value = cache.get(word);
                         if (value) |val| {
-                            var buf: [1024]u8 = undefined;
-                            return try std.fmt.bufPrint(&buf, "${d}\r\n{s}\r\n", .{ val.len, val });
+                            const buf = try allocator.alloc(u8, word.len + 15);
+                            return try std.fmt.bufPrint(buf, "${d}\r\n{s}\r\n", .{ val.len, val });
                         }
-                        return "$-1\r\n";
+                        const buf = try allocator.alloc(u8, 5);
+                        std.mem.copyForwards(u8, buf, "$-1\r\n");
+                        return buf;
                     }
                 },
                 else => {},
@@ -104,7 +111,9 @@ fn get_response(request: []const u8, cache: *Cache) !Response {
         }
         if (std.ascii.eqlIgnoreCase(word, "ping")) {
             // TODO Ping could have an attached message, handle that (can't return early always).
-            return "+PONG\r\n";
+            const buf = try allocator.alloc(u8, 7);
+            std.mem.copyForwards(u8, buf, "+PONG\r\n");
+            return buf;
         }
         if (std.ascii.eqlIgnoreCase(word, "set")) {
             // We know it's a set command, but we don't know the args yet.
@@ -118,11 +127,17 @@ fn get_response(request: []const u8, cache: *Cache) !Response {
         }
     }
     // TODO reply with OK if we don't understand. This is necessary for now because "redis-cli" sometimes sends the COMMANDS command which we don't understand.
-    return "+OK\r\n";
+    const buf = try allocator.alloc(u8, 5);
+    std.mem.copyForwards(u8, buf, "+OK\r\n");
+    return buf;
 }
 
 fn handleClient(client_connection: net.Server.Connection, cache: *Cache) !void {
     defer client_connection.stream.close();
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
     // TODO handle more than 1024 bytes at a time.
     var buf: [1024]u8 = undefined;
@@ -132,7 +147,9 @@ fn handleClient(client_connection: net.Server.Connection, cache: *Cache) !void {
         if (num_read_bytes == 0) {
             break;
         }
-        const response = try get_response(&buf, cache);
+        const response = try get_response(allocator, &buf, cache);
+        defer allocator.free(response);
+
         try client_connection.stream.writeAll(response);
         try stdout.print("Done sending response: {s} to client {}\n", .{ response, client_connection.address.in });
         try cache.print();
@@ -140,6 +157,7 @@ fn handleClient(client_connection: net.Server.Connection, cache: *Cache) !void {
 }
 
 pub fn main() !void {
+    // TODO do smarter allocation because it's expensive to do all this alloc inside get_response
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
