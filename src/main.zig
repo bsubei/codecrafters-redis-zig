@@ -72,9 +72,8 @@ fn get_response(allocator: std.mem.Allocator, request: []const u8, cache: *Cache
                         // Store the key-value with an expiry.
                         if (set.expiry) |_| {
                             const expiry_ms = try std.fmt.parseInt(i64, word, 10);
-                            const now_ms = std.time.timestamp() * std.time.ms_per_s;
+                            const now_ms = std.time.milliTimestamp();
                             const expiry_timestamp = now_ms + expiry_ms;
-                            try stdout.print("EXPIRY TIMESTAMP NS: {d}\n", .{expiry_timestamp});
                             try cache.putWithExpiry(set.key.?, set.value.?, @as(?i64, expiry_timestamp));
                         } else {
                             return Error.MissingExpiryArgument;
@@ -164,8 +163,7 @@ fn handleClient(client_connection: net.Server.Connection, cache: *Cache) !void {
         defer allocator.free(response);
 
         try client_connection.stream.writeAll(response);
-        try stdout.print("Done sending response: {s} to client {}\n", .{ response, client_connection.address.in });
-        try cache.print();
+        try stdout.print("Done sending response: {s} to client {} at timestamp {d}\n", .{ response, client_connection.address.in, std.time.milliTimestamp() });
     }
 }
 

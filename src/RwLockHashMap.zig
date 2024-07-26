@@ -64,7 +64,7 @@ pub const RwLockHashMap = struct {
         const pair = self.map.get(key);
         if (pair) |p| {
             if (p.expiry_timestamp_ms) |ts| {
-                const now_ms = std.time.timestamp() * std.time.ms_per_s;
+                const now_ms = std.time.milliTimestamp();
                 if (ts > now_ms) {
                     return p.value;
                 }
