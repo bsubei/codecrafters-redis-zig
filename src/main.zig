@@ -93,8 +93,11 @@ fn get_response(allocator: std.mem.Allocator, request: []const u8, cache: *Cache
                     if (i == get.index + 2) {
                         const value = cache.get(word);
                         if (value) |val| {
-                            const buf = try allocator.alloc(u8, word.len + 15);
-                            return try std.fmt.bufPrint(buf, "${d}\r\n{s}\r\n", .{ val.len, val });
+                            var buf: [1024]u8 = undefined;
+                            const filled = try std.fmt.bufPrint(&buf, "${d}\r\n{s}\r\n", .{ val.len, val });
+                            const response = try allocator.alloc(u8, filled.len);
+                            std.mem.copyForwards(u8, response, filled);
+                            return response;
                         }
                         const buf = try allocator.alloc(u8, 5);
                         std.mem.copyForwards(u8, buf, "$-1\r\n");
