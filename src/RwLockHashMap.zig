@@ -8,7 +8,7 @@ pub const RwLockHashMap = struct {
     const Self = @This();
     const K = []const u8;
     const V = []const u8;
-    const ValueTimestampPair = struct { value: V, expiry_timestamp: ?u64 };
+    const ValueTimestampPair = struct { value: V, expiry_timestamp_ms: ?i64 };
 
     map: std.StringHashMap(ValueTimestampPair),
     rwLock: RwLock,
@@ -31,6 +31,10 @@ pub const RwLockHashMap = struct {
 
     // Given strings or u8 slices (key-value pair), insert them into the hash map by copying them.
     pub fn put(self: *Self, key: K, value: V) !void {
+        try self.putWithExpiry(key, value, null);
+    }
+
+    pub fn putWithExpiry(self: *Self, key: K, value: V, expiry: ?i64) !void {
         self.rwLock.lock();
         defer self.rwLock.unlock();
 
@@ -42,15 +46,15 @@ pub const RwLockHashMap = struct {
         if (self.map.getPtr(key)) |old_value_ptr| {
             // We need to free the old string because no one looks at it anymore.
             self.map.allocator.free(old_value_ptr.*.value);
-            old_value_ptr.* = .{ .value = owned_value, .expiry_timestamp = null };
+            old_value_ptr.* = .{ .value = owned_value, .expiry_timestamp_ms = expiry };
         } else {
             // Create the key and value.
             const owned_key = try self.map.allocator.dupe(u8, key);
             errdefer self.map.allocator.free(owned_key);
             const new_entry = try self.map.allocator.create(ValueTimestampPair);
-            new_entry.* = .{ .value = owned_value, .expiry_timestamp = null };
+            new_entry.* = .{ .value = owned_value, .expiry_timestamp_ms = expiry };
             // Insert the copied key and value.
-            try self.map.put(owned_key, .{ .value = owned_value, .expiry_timestamp = null });
+            try self.map.put(owned_key, new_entry.*);
         }
     }
 
@@ -58,7 +62,16 @@ pub const RwLockHashMap = struct {
         self.rwLock.lockShared();
         defer self.rwLock.unlockShared();
         const pair = self.map.get(key);
-        if (pair) |p| return p.value;
+        if (pair) |p| {
+            if (p.expiry_timestamp_ms) |ts| {
+                const now_ms = std.time.timestamp() * std.time.ms_per_s;
+                if (ts > now_ms) {
+                    return p.value;
+                }
+            } else {
+                return p.value;
+            }
+        }
         return null;
     }
 
@@ -69,7 +82,7 @@ pub const RwLockHashMap = struct {
         try stdout.print("Cache size: {d}\nContents:\n", .{self.count()});
         var it = self.map.iterator();
         while (it.next()) |entry| {
-            try stdout.print("{s}: {s} {?}\n", .{ entry.key_ptr.*, entry.value_ptr.value, entry.value_ptr.expiry_timestamp });
+            try stdout.print("{s}: {s} {?}\n", .{ entry.key_ptr.*, entry.value_ptr.value, entry.value_ptr.expiry_timestamp_ms });
         }
     }
 

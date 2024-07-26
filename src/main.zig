@@ -68,18 +68,14 @@ fn get_response(allocator: std.mem.Allocator, request: []const u8, cache: *Cache
                             command.?.set.expiry = word;
                             continue;
                         }
-                        // Store the key-value without an expiry.
-                        try cache.put(set.key.?, set.value.?);
-                        const buf = try allocator.alloc(u8, 5);
-                        std.mem.copyForwards(u8, buf, "+OK\r\n");
-                        return buf;
                     } else if (i == set.index + 8) {
                         // Store the key-value with an expiry.
                         if (set.expiry) |_| {
-                            // TODO Finish defining putWithExpiry and converting expiry string to timestamp.
-                            // try cache.putWithExpiry(set.key.?, set.value.?, word);
-                            try stdout.print("EXPIRY: {s}\n", .{word});
-                            try cache.put(set.key.?, set.value.?);
+                            const expiry_ms = try std.fmt.parseInt(i64, word, 10);
+                            const now_ms = std.time.timestamp() * std.time.ms_per_s;
+                            const expiry_timestamp = now_ms + expiry_ms;
+                            try stdout.print("EXPIRY TIMESTAMP NS: {d}\n", .{expiry_timestamp});
+                            try cache.putWithExpiry(set.key.?, set.value.?, @as(?i64, expiry_timestamp));
                         } else {
                             return Error.MissingExpiryArgument;
                         }
