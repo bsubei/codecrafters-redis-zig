@@ -8,12 +8,13 @@ pub const RwLockHashMap = struct {
     const Self = @This();
     const K = []const u8;
     const V = []const u8;
+    const ValueTimestampPair = struct { value: V, expiry_timestamp: ?u64 };
 
-    map: std.StringHashMap(V),
+    map: std.StringHashMap(ValueTimestampPair),
     rwLock: RwLock,
 
     pub fn init(allocator: Allocator) Self {
-        return .{ .map = std.StringHashMap(V).init(allocator), .rwLock = RwLock{} };
+        return .{ .map = std.StringHashMap(ValueTimestampPair).init(allocator), .rwLock = RwLock{} };
     }
 
     pub fn deinit(self: *Self) void {
@@ -21,7 +22,8 @@ pub const RwLockHashMap = struct {
         var iter = self.map.iterator();
         while (iter.next()) |entry| {
             self.map.allocator.free(entry.key_ptr.*);
-            self.map.allocator.free(entry.value_ptr.*);
+            self.map.allocator.free(entry.value_ptr.*.value);
+            self.map.allocator.destroy(entry.value_ptr);
         }
         // Free the map itself.
         self.map.deinit();
@@ -32,25 +34,32 @@ pub const RwLockHashMap = struct {
         self.rwLock.lock();
         defer self.rwLock.unlock();
 
-        // We definitely need to copy the value and own it because the old one is going away.
+        // We definitely need to copy the string value and own it because the old one is going away.
         const owned_value = try self.map.allocator.dupe(u8, value);
         errdefer self.map.allocator.free(owned_value);
+
         // Remove the old value, place the new one in its stead.
         if (self.map.getPtr(key)) |old_value_ptr| {
-            self.map.allocator.free(old_value_ptr.*);
-            old_value_ptr.* = owned_value;
+            // We need to free the old string because no one looks at it anymore.
+            self.map.allocator.free(old_value_ptr.*.value);
+            old_value_ptr.* = .{ .value = owned_value, .expiry_timestamp = null };
         } else {
+            // Create the key and value.
             const owned_key = try self.map.allocator.dupe(u8, key);
             errdefer self.map.allocator.free(owned_key);
+            const new_entry = try self.map.allocator.create(ValueTimestampPair);
+            new_entry.* = .{ .value = owned_value, .expiry_timestamp = null };
             // Insert the copied key and value.
-            try self.map.put(owned_key, owned_value);
+            try self.map.put(owned_key, .{ .value = owned_value, .expiry_timestamp = null });
         }
     }
 
     pub fn get(self: *Self, key: K) ?V {
         self.rwLock.lockShared();
         defer self.rwLock.unlockShared();
-        return self.map.get(key);
+        const pair = self.map.get(key);
+        if (pair) |p| return p.value;
+        return null;
     }
 
     pub fn print(self: *Self) !void {
@@ -60,7 +69,7 @@ pub const RwLockHashMap = struct {
         try stdout.print("Cache size: {d}\nContents:\n", .{self.count()});
         var it = self.map.iterator();
         while (it.next()) |entry| {
-            try stdout.print("{s}: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+            try stdout.print("{s}: {s} {?}\n", .{ entry.key_ptr.*, entry.value_ptr.value, entry.value_ptr.expiry_timestamp });
         }
     }
 
