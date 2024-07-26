@@ -1,34 +1,29 @@
-[![progress-banner](https://backend.codecrafters.io/progress/redis/6cff81fd-2a58-4e8f-9776-0cdc39747e40)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
+# Codecrafters Redis
+This is WIP Zig solution to the ["Build Your Own Redis" Challenge](https://codecrafters.io/challenges/redis).
 
-This is a starting point for Zig solutions to the
-["Build Your Own Redis" Challenge](https://codecrafters.io/challenges/redis).
+# Requirements
 
-In this challenge, you'll build a toy Redis clone that's capable of handling
-basic commands like `PING`, `SET` and `GET`. Along the way we'll learn about
-event loops, the Redis protocol and more.
+- zig 0.12
+- if you want to run the `redis-tester` integration tests, you need `go` and you need to grab the `redis-tester` git submodule: `git submodule update --init --recursive`.
 
-**Note**: If you're viewing this repo on GitHub, head over to
-[codecrafters.io](https://codecrafters.io) to try the challenge.
+# TODOs
 
-# Passing the first stage
+## Important
+- [ ] redo parser in a more general way, it's extremely hacky right now
+- [ ] figure out allocation for parser
 
-The entry point for your Redis implementation is in `src/main.zig`. Study and
-uncomment the relevant code, and push your changes to pass the first stage:
 
-```sh
-git add .
-git commit -m "pass 1st stage" # any msg
-git push origin master
-```
+## Nice-to-haves
+- [ ] set up the integration tests to use the Zig build system instead of crappy Make.
 
-That's all!
+# Work Log
 
-# Stage 2 & beyond
+## Base Challenge
 
-Note: This section is for stages 2 and beyond.
+- Finished base challenge (ECHO, GET and SET). Parsing is extremely hacky and needs redone.
+- Needs a bit more unit tests, at least for the hash map.
+- Figured out how to run the `redis-tester` to run integration tests locally instead of on their remote machines (which doesn't let you choose what tests to run).
 
-1. Ensure you have `zig (0.12)` installed locally
-1. Run `./your_program.sh` to run your Redis server, which is implemented in
-   `src/main.zig`.
-1. Commit your changes and run `git push origin master` to submit your solution
-   to CodeCrafters. Test output will be streamed to your terminal.
+## Refactor
+
+- TODO start refactoring parser
