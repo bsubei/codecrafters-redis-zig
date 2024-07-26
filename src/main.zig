@@ -126,6 +126,20 @@ fn get_response(allocator: std.mem.Allocator, request: []const u8, cache: *Cache
             continue;
         }
     }
+    // Leftover, was looking for px for SET command but found none.
+    // Store the key-value without an expiry.
+    if (command) |cmd| {
+        switch (cmd) {
+            .set => |set| {
+                try cache.put(set.key.?, set.value.?);
+                const buf = try allocator.alloc(u8, 5);
+                std.mem.copyForwards(u8, buf, "+OK\r\n");
+                return buf;
+            },
+            else => {},
+        }
+    }
+
     // TODO reply with OK if we don't understand. This is necessary for now because "redis-cli" sometimes sends the COMMANDS command which we don't understand.
     const buf = try allocator.alloc(u8, 5);
     std.mem.copyForwards(u8, buf, "+OK\r\n");
