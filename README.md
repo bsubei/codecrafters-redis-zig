@@ -1,5 +1,5 @@
 # Codecrafters Redis
-This is WIP Zig solution to the ["Build Your Own Redis" Challenge](https://codecrafters.io/challenges/redis).
+This is a WIP Zig solution to the ["Build Your Own Redis" Challenge](https://codecrafters.io/challenges/redis).
 
 # Requirements
 

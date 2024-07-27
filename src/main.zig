@@ -33,11 +33,14 @@ const Error = error{
     MissingExpiryArgument,
 };
 
+const MAX_CLIENT_MESSAGE_SIZE = 1 << 20;
+const CLIENT_READER_CHUNK_SIZE = 1 << 10;
+
 // The server produces and sends a Response back to the client.
 const Response = []const u8;
 // TODO implement proper parsing. For now, we're just assuming the structure of incoming messages look like this:
 // *2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n
-fn get_response(allocator: std.mem.Allocator, request: []const u8, cache: *Cache) !Response {
+fn getResponse(allocator: std.mem.Allocator, request: []const u8, cache: *Cache) !Response {
     var it = std.mem.tokenizeSequence(u8, request, "\r\n");
     var i: u32 = 0;
 
@@ -48,6 +51,7 @@ fn get_response(allocator: std.mem.Allocator, request: []const u8, cache: *Cache
             switch (cmd) {
                 .echo => |echo| {
                     if (i == echo.index + 2) {
+                        // TODO create a make_response function to make this less ugly.
                         const buf = try allocator.alloc(u8, word.len + 3);
                         return try std.fmt.bufPrint(buf, "+{s}\r\n", .{word});
                     }
@@ -78,10 +82,7 @@ fn get_response(allocator: std.mem.Allocator, request: []const u8, cache: *Cache
                         } else {
                             return Error.MissingExpiryArgument;
                         }
-                        // TODO create a make_response function to make this less ugly.
-                        const buf = try allocator.alloc(u8, 5);
-                        std.mem.copyForwards(u8, buf, "+OK\r\n");
-                        return buf;
+                        return "+OK\r\n";
                     }
                 },
                 .get => |get| {
@@ -94,9 +95,7 @@ fn get_response(allocator: std.mem.Allocator, request: []const u8, cache: *Cache
                             std.mem.copyForwards(u8, response, filled);
                             return response;
                         }
-                        const buf = try allocator.alloc(u8, 5);
-                        std.mem.copyForwards(u8, buf, "$-1\r\n");
-                        return buf;
+                        return "$-1\r\n";
                     }
                 },
                 else => {},
@@ -109,9 +108,7 @@ fn get_response(allocator: std.mem.Allocator, request: []const u8, cache: *Cache
         }
         if (std.ascii.eqlIgnoreCase(word, "ping")) {
             // TODO Ping could have an attached message, handle that (can't return early always).
-            const buf = try allocator.alloc(u8, 7);
-            std.mem.copyForwards(u8, buf, "+PONG\r\n");
-            return buf;
+            return "+PONG\r\n";
         }
         if (std.ascii.eqlIgnoreCase(word, "set")) {
             // We know it's a set command, but we don't know the args yet.
@@ -130,45 +127,73 @@ fn get_response(allocator: std.mem.Allocator, request: []const u8, cache: *Cache
         switch (cmd) {
             .set => |set| {
                 try cache.put(set.key.?, set.value.?);
-                const buf = try allocator.alloc(u8, 5);
-                std.mem.copyForwards(u8, buf, "+OK\r\n");
-                return buf;
+                return "+OK\r\n";
             },
             else => {},
         }
     }
 
     // TODO reply with OK if we don't understand. This is necessary for now because "redis-cli" sometimes sends the COMMANDS command which we don't understand.
-    const buf = try allocator.alloc(u8, 5);
-    std.mem.copyForwards(u8, buf, "+OK\r\n");
-    return buf;
+    return "+OK\r\n";
 }
 
+fn readChunk(client_connection: net.Server.Connection, message_ptr: *std.ArrayList(u8)) !usize {
+    // Read one chunk.
+    var buf: [CLIENT_READER_CHUNK_SIZE]u8 = undefined;
+    const num_read_bytes = client_connection.stream.read(&buf) catch |err| {
+        // Handle retry, otherwise bubble up any errors.
+        // if (err == error.WouldBlock) return readChunk(client_connection, message);
+        return err;
+    };
+    try stdout.print("Read {d} bytes: {s}\n", .{ num_read_bytes, buf[0..num_read_bytes] });
+
+    // Save this chunk to the message.
+    try message_ptr.appendSlice(buf[0..num_read_bytes]);
+
+    return num_read_bytes;
+}
 fn handleClient(client_connection: net.Server.Connection, cache: *Cache) !void {
     defer client_connection.stream.close();
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // We don't expect each client to use up too much memory, so we use an arena allocator for speed and blow away all the memory at once when we're done.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
-    // TODO handle more than 1024 bytes at a time.
-    var buf: [1024]u8 = undefined;
+    // Because the client will send data and wait for our reply before closing the socket connection, we can't just "read all bytes" from the stream
+    // then parse them at our leisure, since we would block forever waiting for end of stream which will never come.
+    // The clean alternative would be to read until seeing a delimiter ('\n' for example) or eof, but misbehaving clients could misbehave and not send either and block us forever.
+    // Since I don't know how to make those calls use timeouts, I'll just call read() one chunk at a time (nonblocking) and concatenate them into the final message.
+    var message = std.ArrayList(u8).init(allocator);
+    // No need to dealloc since we're using an arena allocator.
+
     while (true) {
-        const num_read_bytes = client_connection.stream.read(&buf) catch break;
-        try stdout.print("Read {d} bytes: {s}\n", .{ num_read_bytes, buf[0..num_read_bytes] });
-        if (num_read_bytes == 0) {
-            break;
-        }
-        const response = try get_response(allocator, &buf, cache);
-        defer allocator.free(response);
+        // Read one chunk and append it to the message.
+        const num_read_bytes = try readChunk(client_connection, &message);
 
+        // Connection closed, leave if there's no pending message to send.
+        if (num_read_bytes == 0 and message.items.len == 0) {
+            return;
+        }
+        // There's possibly more to read for this message! Go back and read another chunk.
+        if (num_read_bytes == CLIENT_READER_CHUNK_SIZE) {
+            continue;
+        }
+
+        // Now that we've fully read the message, we can parse it and form a response.
+        const response = try getResponse(allocator, message.items, cache);
+        // No need to dealloc since we're using an arena allocator.
+
+        // Send the response back to the client.
         try client_connection.stream.writeAll(response);
         try stdout.print("Done sending response: {s} to client {} at timestamp {d}\n", .{ response, client_connection.address.in, std.time.milliTimestamp() });
+
+        // Clear the message since the client might send more, but don't actually deallocate so we can reuse this for the next message.
+        message.clearRetainingCapacity();
     }
 }
 
 pub fn main() !void {
-    // TODO do smarter allocation because it's expensive to do all this alloc inside get_response
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -190,6 +215,7 @@ pub fn main() !void {
 
         try stdout.print("accepted new connection from client {}\n", .{connection.address.in.sa.port});
         // TODO join on these threads for correctness.
+        // TODO handle errors coming back from these threads.
         const t = try std.Thread.spawn(.{}, handleClient, .{ connection, &cache });
         t.detach();
     }
