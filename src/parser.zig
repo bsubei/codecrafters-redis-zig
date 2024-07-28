@@ -5,11 +5,13 @@ const Cache = @import("rw_lock_hashmap.zig").RwLockHashMap;
 const testing = std.testing;
 
 pub const CLIENT_READER_CHUNK_SIZE = 1 << 10;
+const CRLF_DELIMITER = "\r\n";
 
 const Error = error{
     MissingExpiryArgument,
     UnknownMessageType,
     MissingDelimiter,
+    BulkStringBadLengthHeader,
 };
 
 // Bytes coming in from the client socket are first parsed as a Message, which is then further interpreted as a
@@ -21,12 +23,11 @@ const SimpleString = struct {
 
     fn parse(raw_message: []const u8) !@This() {
         const skip_first = raw_message[1..];
-        const index = std.mem.indexOf(u8, skip_first, "\r\n");
+        const index = std.mem.indexOf(u8, skip_first, CRLF_DELIMITER);
         if (index) |idx| {
             return .{ .value = skip_first[0..idx] };
-        } else {
-            return Error.MissingDelimiter;
         }
+        return Error.MissingDelimiter;
     }
 };
 
@@ -34,9 +35,24 @@ const BulkString = struct {
     value: []const u8,
 
     fn parse(raw_message: []const u8) !@This() {
-        // TODO
-        _ = raw_message;
-        return .{ .value = "" };
+        const skip_first = raw_message[1..];
+        const index_crlf = std.mem.indexOf(u8, skip_first, CRLF_DELIMITER);
+        if (index_crlf) |idx_crlf| {
+            const length_header = skip_first[0..idx_crlf];
+            if (length_header.len == 0) {
+                return Error.BulkStringBadLengthHeader;
+            }
+            // Special case, handle null bulk string.
+            // TODO we can't distinguish between an actual null BulkString from an empty BulkString but maybe that's fine.
+            if (std.mem.eql(u8, length_header, "-1") or length_header[0] == '0') {
+                return .{ .value = "" };
+            }
+            const num_chars = std.fmt.parseInt(u32, length_header, 10) catch return Error.BulkStringBadLengthHeader;
+            const text_idx_start = idx_crlf + CRLF_DELIMITER.len;
+            const text_idx_end = text_idx_start + num_chars;
+            return .{ .value = skip_first[text_idx_start..text_idx_end] };
+        }
+        return Error.MissingDelimiter;
     }
 };
 const Array = struct {
@@ -105,6 +121,17 @@ test "parse Message missing delimiter" {
 test "parse Message SimpleString" {
     try testing.expectEqualSlices(u8, (try Message.fromStr("+\r\n")).simple_string.value, "");
     try testing.expectEqualSlices(u8, (try Message.fromStr("+Hi there, my name is Zog!\r\n")).simple_string.value, "Hi there, my name is Zog!");
+}
+test "parse Message BulkString" {
+    try testing.expectEqualSlices(u8, (try Message.fromStr("$1\r\nx\r\n")).bulk_string.value, "x");
+    try testing.expectEqualSlices(u8, "1234567890", (try Message.fromStr("$10\r\n1234567890\r\n")).bulk_string.value);
+    try testing.expectEqualSlices(u8, "", (try Message.fromStr("$-1\r\n")).bulk_string.value);
+    try testing.expectEqualSlices(u8, "", (try Message.fromStr("$0\r\n\r\n")).bulk_string.value);
+}
+test "parse Message BulkString bad length header" {
+    try testing.expectError(Error.BulkStringBadLengthHeader, Message.fromStr("$\r\n\r\n"));
+    try testing.expectError(Error.BulkStringBadLengthHeader, Message.fromStr("$not_an_int\r\nhibye\r\n"));
+    try testing.expectError(Error.BulkStringBadLengthHeader, Message.fromStr("$5.0\r\nhibye\r\n"));
 }
 
 // Messages from the client are parsed as one of these Requests, which are then processed to produce a Response.
