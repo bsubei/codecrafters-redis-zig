@@ -2,52 +2,122 @@ const std = @import("std");
 const net = std.net;
 const stdout = std.io.getStdOut().writer();
 const Cache = @import("rw_lock_hashmap.zig").RwLockHashMap;
+const testing = std.testing;
 
 pub const CLIENT_READER_CHUNK_SIZE = 1 << 10;
 
 const Error = error{
     MissingExpiryArgument,
+    UnknownMessageType,
+    MissingDelimiter,
 };
 
 // Bytes coming in from the client socket are first parsed as a Message, which is then further interpreted as a
-// Request. The Request is handled and a Response is produced. Finally, the Response is converted into a Message,
-// which is then sent back to the client over the socket as a sequence of bytes.
+// Request (a command from the client). The server then handles the Request (state updates are applied) and a response Message is produced.
+// Finally, the response Message is sent back to the client as a sequence of bytes.
 // NOTE: we have to make these into wrapper classes because otherwise these String types would be aliases to []const u8, and then we can't distinguish between the two in the tagged union.
-const SimpleString = struct { value: []const u8 };
-const BulkString = struct { value: []const u8 };
-// TODO update Array to actually contain other Message elements.
-const Array = struct { length: u32, elements: std.ArrayList([]const u8) };
-const Message = union(enum) {
+const SimpleString = struct {
+    value: []const u8,
+
+    fn parse(raw_message: []const u8) !@This() {
+        const skip_first = raw_message[1..];
+        const index = std.mem.indexOf(u8, skip_first, "\r\n");
+        if (index) |idx| {
+            return .{ .value = skip_first[0..idx] };
+        } else {
+            return Error.MissingDelimiter;
+        }
+    }
+};
+
+const BulkString = struct {
+    value: []const u8,
+
+    fn parse(raw_message: []const u8) !@This() {
+        // TODO
+        _ = raw_message;
+        return .{ .value = "" };
+    }
+};
+const Array = struct {
+    elements: std.ArrayList(Message),
+
+    fn parse(raw_message: []const u8) !@This() {
+        // TODO
+        _ = raw_message;
+        return .{ .elements = undefined };
+    }
+};
+
+const MessageType = enum {
+    simple_string,
+    bulk_string,
+    array,
+    const Self = @This();
+    fn fromByte(byte: u8) !@This() {
+        return switch (byte) {
+            '+' => Self.simple_string,
+            '$' => Self.bulk_string,
+            '*' => Self.array,
+            else => Error.UnknownMessageType,
+        };
+    }
+};
+const Message = union(MessageType) {
     simple_string: SimpleString,
     bulk_string: BulkString,
     array: Array,
+
+    const Self = @This();
+    fn parse(raw_message: []const u8, message_type: MessageType) !Self {
+        // TODO less boilerplate, probably using builtins
+        return switch (message_type) {
+            .simple_string => .{ .simple_string = try SimpleString.parse(raw_message) },
+            .bulk_string => .{ .bulk_string = try BulkString.parse(raw_message) },
+            .array => .{ .array = try Array.parse(raw_message) },
+        };
+    }
+    // TODO I think we have to allocate the Message here because of the Array being recursive.
+    fn fromStr(raw_message: []const u8) !Self {
+        // The first byte tells you what kind of message this is.
+        const message_type = try MessageType.fromByte(raw_message[0]);
+
+        // Depending on the contents of the string, parse it. Examples:
+        // +OK\r\n --> this is a SimpleString containing "OK".
+        // $5\r\nhello\r\n --> this is a BulkString containing "hello".
+        // *2\r\n$2\r\nhi\r\n$3\r\nbye\r\n --> this is an Array with two BulkStrings: first one contains "hi" and the second contains "bye".
+        return parse(raw_message, message_type);
+    }
+    // Caller owns returned string.
+    fn toStr(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
+        _ = self;
+        _ = allocator;
+        return error.UnimplementedError;
+    }
 };
 
+test "parse Message Unknown type" {
+    try testing.expectError(Error.UnknownMessageType, Message.fromStr(".cannot parse this\r\n"));
+}
+test "parse Message missing delimiter" {
+    try testing.expectError(Error.MissingDelimiter, Message.fromStr("+I will ramble on forever with no end on and on and on and"));
+}
+test "parse Message SimpleString" {
+    try testing.expectEqualSlices(u8, (try Message.fromStr("+\r\n")).simple_string.value, "");
+    try testing.expectEqualSlices(u8, (try Message.fromStr("+Hi there, my name is Zog!\r\n")).simple_string.value, "Hi there, my name is Zog!");
+}
+
 // Messages from the client are parsed as one of these Requests, which are then processed to produce a Response.
-const PingCommand = struct { index: u32 };
-const EchoCommand = struct { index: u32 };
-// Even though the set command takes two args, we only need to store one arg because we're done as soon as we see the second arg.
-const SetCommand = struct { index: u32, key: ?[]const u8, value: ?[]const u8, expiry: ?[]const u8 };
-const GetCommand = struct { index: u32 };
+const PingCommand = struct { contents: ?[]const u8 };
+const EchoCommand = struct { contents: []const u8 };
+const SetCommand = struct { key: []const u8, value: []const u8, expiry: Cache.ExpiryTimestampMs };
+const GetCommand = struct { key: []const u8 };
 const Request = union(enum) {
     ping: PingCommand,
     echo: EchoCommand,
     set: SetCommand,
     get: GetCommand,
 };
-
-fn strToMessage(raw_message: []const u8) !Message {
-    _ = raw_message;
-
-    // The first byte tells you what kind of message this is.
-
-    // Depending on the contents of the string, parse it. Examples:
-    // +OK\r\n --> this is a SimpleString containing "OK".
-    // $5\r\nhello\r\n --> this is a BulkString containing "hello".
-    // *2\r\n$2\r\nhi\r\n$3\r\nbye\r\n --> this is an Array with two BulkStrings: first one contains "hi" and the second contains "bye".
-
-    return error.UnimplementedError;
-}
 
 fn messageToRequest(message: Message) !Request {
     _ = message;
@@ -57,7 +127,7 @@ fn messageToRequest(message: Message) !Request {
 pub fn parseRequest(raw_message: []const u8) !Request {
     // Parse the raw_message into a Message.
     // TODO I think we can get away without having to allocate anything for Message or Request. We can just have slices into the raw_message string.
-    const message = try strToMessage(raw_message);
+    const message = try Message.fromStr(raw_message);
     // Parse the Message into a Request.
     return messageToRequest(message);
 }
@@ -76,17 +146,10 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Ca
 }
 
 // Caller owns returned string.
-fn messageToStr(allocator: std.mem.Allocator, message: *Message) ![]const u8 {
-    _ = allocator;
-    _ = message;
-    return error.UnimplementedError;
-}
-
-// Caller owns returned string.
 pub fn getResponse(allocator: std.mem.Allocator, request: Request, cache: *Cache) ![]const u8 {
     const response_message = try getResponseMessage(allocator, request, cache);
     defer allocator.destroy(response_message);
-    return messageToStr(allocator, response_message);
+    return response_message.toStr(allocator);
 }
 
 pub fn readChunk(client_connection: net.Server.Connection, message_ptr: *std.ArrayList(u8)) !usize {

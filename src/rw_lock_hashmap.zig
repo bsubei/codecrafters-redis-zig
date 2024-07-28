@@ -9,7 +9,8 @@ pub const RwLockHashMap = struct {
     const Self = @This();
     const K = []const u8;
     const V = []const u8;
-    const ValueTimestampPair = struct { value: V, expiry_timestamp_ms: ?i64 };
+    pub const ExpiryTimestampMs = ?i64;
+    const ValueTimestampPair = struct { value: V, expiry_timestamp_ms: ExpiryTimestampMs };
 
     map: std.StringHashMap(ValueTimestampPair),
     rwLock: RwLock,
@@ -35,7 +36,7 @@ pub const RwLockHashMap = struct {
         try self.putWithExpiry(key, value, null);
     }
 
-    pub fn putWithExpiry(self: *Self, key: K, value: V, expiry: ?i64) !void {
+    pub fn putWithExpiry(self: *Self, key: K, value: V, expiry: ExpiryTimestampMs) !void {
         self.rwLock.lock();
         defer self.rwLock.unlock();
 
