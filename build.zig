@@ -33,27 +33,20 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
-    // Add test step.
-    const test_step = b.step("test", "Run the tests");
-    // TODO figure out how to properly run all tests defined in all files. We're hardcoding the file names for now.
-    const test_runner = b.addTest(.{ .root_source_file = b.path("src/rw_lock_hashmap.zig"), .target = target, .optimize = optimize });
-    //    // Create a test runner.
-    //    const test_runner = b.addTest(.{
-    //        .root_source_file = b.path("src/tests.zig"),
-    //        .target = target,
-    //        .optimize = optimize,
-    //    });
-    //    // Add all the .zig files in the src/ directory to the test runner.
-    //    const src_dir = std.fs.cwd().openDir("src", .{ .iterate = true }) catch unreachable;
-    //    var walker = src_dir.walk(b.allocator) catch unreachable;
-    //    defer walker.deinit();
-    //
-    //    while (walker.next() catch unreachable) |entry| {
-    //        if (entry.kind == .file and std.mem.endsWith(u8, entry.path, ".zig")) {
-    //            test_runner.addIncludePath(b.path(b.fmt("src/{s}", .{entry.path})));
-    //        }
-    //    }
 
-    const run_tests = b.addRunArtifact(test_runner);
-    test_step.dependOn(&run_tests.step);
+    // Add all the .zig files in the src/ directory to a test step.
+    const test_step = b.step("test", "Run unit tests");
+    const src_dir = std.fs.cwd().openDir("src", .{ .iterate = true }) catch unreachable;
+    var walker = src_dir.walk(b.allocator) catch unreachable;
+    defer walker.deinit();
+
+    while (walker.next() catch unreachable) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.path, ".zig")) {
+            const test_artifact = b.addTest(.{
+                .root_source_file = .{ .path = b.pathJoin(&.{ "src", entry.path }) },
+                .target = target,
+            });
+            test_step.dependOn(&b.addRunArtifact(test_artifact).step);
+        }
+    }
 }

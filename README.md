@@ -15,6 +15,7 @@ This is a WIP Zig solution to the ["Build Your Own Redis" Challenge](https://cod
 
 ## Nice-to-haves
 - [ ] set up the integration tests to use the Zig build system instead of crappy Make.
+- [x] proper unit test discovery in build.zig
 
 # Work Log
 
