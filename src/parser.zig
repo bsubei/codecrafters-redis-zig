@@ -25,10 +25,10 @@ const SimpleString = struct {
     value: []const u8,
 
     fn parse(raw_message: []const u8) Error!@This() {
-        const skip_first = raw_message[1..];
-        const index = std.mem.indexOf(u8, skip_first, CRLF_DELIMITER);
+        const rest_of_text = raw_message[1..];
+        const index = std.mem.indexOf(u8, rest_of_text, CRLF_DELIMITER);
         if (index) |idx| {
-            return .{ .value = skip_first[0..idx] };
+            return .{ .value = rest_of_text[0..idx] };
         }
         return Error.MissingDelimiter;
     }
@@ -38,10 +38,10 @@ const BulkString = struct {
     value: []const u8,
 
     fn parse(raw_message: []const u8) Error!@This() {
-        const skip_first = raw_message[1..];
-        const index_crlf = std.mem.indexOf(u8, skip_first, CRLF_DELIMITER);
+        const rest_of_text = raw_message[1..];
+        const index_crlf = std.mem.indexOf(u8, rest_of_text, CRLF_DELIMITER);
         if (index_crlf) |idx_crlf| {
-            const length_header = skip_first[0..idx_crlf];
+            const length_header = rest_of_text[0..idx_crlf];
             if (length_header.len == 0) {
                 return Error.BulkStringBadLengthHeader;
             }
@@ -53,7 +53,7 @@ const BulkString = struct {
             const num_chars = std.fmt.parseInt(u32, length_header, 10) catch return Error.BulkStringBadLengthHeader;
             const text_idx_start = idx_crlf + CRLF_DELIMITER.len;
             const text_idx_end = text_idx_start + num_chars;
-            return .{ .value = skip_first[text_idx_start..text_idx_end] };
+            return .{ .value = rest_of_text[text_idx_start..text_idx_end] };
         }
         return Error.MissingDelimiter;
     }
@@ -63,34 +63,55 @@ const Array = struct {
     allocator: std.mem.Allocator,
 
     fn parse(allocator: std.mem.Allocator, raw_message: []const u8) Error!@This() {
-        const skip_first = raw_message[1..];
-        const index_crlf = std.mem.indexOf(u8, skip_first, CRLF_DELIMITER);
+        var rest_of_text = raw_message[1..];
+        const index_crlf = std.mem.indexOf(u8, rest_of_text, CRLF_DELIMITER);
         if (index_crlf) |idx_crlf| {
-            const num_elements_header = skip_first[0..idx_crlf];
+            const num_elements_header = rest_of_text[0..idx_crlf];
             if (num_elements_header.len == 0) {
                 return Error.ArrayBadLengthHeader;
-            }
-            if (num_elements_header[0] == '0') {
-                return .{ .elements = try allocator.alloc(Message, 0), .allocator = allocator };
             }
             const num_elements = std.fmt.parseInt(u32, num_elements_header, 10) catch return Error.ArrayBadLengthHeader;
             const elements = try allocator.alloc(Message, num_elements);
             errdefer allocator.free(elements);
 
+            // Chomp off (remove) everything we've read so far.
+            rest_of_text = rest_of_text[idx_crlf + CRLF_DELIMITER.len ..];
             // For each element, parse one Message from the remainder of the text
-            var start_idx = idx_crlf + CRLF_DELIMITER.len;
             for (0..elements.len) |i| {
-                const rest_of_text = skip_first[start_idx..];
-                const message = try Message.fromStr(allocator, rest_of_text);
+                var message = try Message.fromStr(allocator, rest_of_text);
+                errdefer message.deinit();
                 switch (message) {
                     // Disallow nested messages that are themselves arrays.
                     .array => return Error.ArrayInvalidNestedMessage,
-                    else => {
+                    .simple_string => {
+                        // Save the message we just parsed.
                         elements[i] = message;
+
+                        // Skip over one CRLF to prepare us for parsing the next message.
+                        const nested_index_crlf = std.mem.indexOf(u8, rest_of_text, CRLF_DELIMITER);
+                        if (nested_index_crlf) |nested_idx_crlf| {
+                            rest_of_text = rest_of_text[nested_idx_crlf + CRLF_DELIMITER.len ..];
+                        } else {
+                            return Error.MissingDelimiter;
+                        }
+                    },
+                    .bulk_string => {
+                        // Save the message we just parsed.
+                        elements[i] = message;
+
+                        // Skip over two CRLF to prepare us for parsing the next message.
+                        const nested_index_crlf = std.mem.indexOf(u8, rest_of_text, CRLF_DELIMITER);
+                        if (nested_index_crlf) |nested_idx_crlf| {
+                            rest_of_text = rest_of_text[nested_idx_crlf + CRLF_DELIMITER.len ..];
+                            const again_index = std.mem.indexOf(u8, rest_of_text, CRLF_DELIMITER);
+                            if (again_index) |again_idx| {
+                                rest_of_text = rest_of_text[again_idx + CRLF_DELIMITER.len ..];
+                            }
+                        } else {
+                            return Error.MissingDelimiter;
+                        }
                     },
                 }
-                // TODO update start_idx
-                start_idx = start_idx + 0;
             }
 
             return .{ .elements = elements, .allocator = allocator };
@@ -124,7 +145,7 @@ const Message = union(MessageType) {
     pub fn deinit(self: *Self) void {
         switch (self.*) {
             .array => {
-                // TODO recursive?
+                // NOTE: we don't need to recursively free because our elements are guaranteed never to be Arrays themselves.
                 self.array.allocator.free(self.array.elements);
             },
             else => return,
@@ -138,7 +159,7 @@ const Message = union(MessageType) {
             .array => .{ .array = try Array.parse(allocator, raw_message) },
         };
     }
-    // Caller is responsible for calling deinit() on returned Message.
+    // Caller is responsible for calling deinit() on returned Message, which is only strictly necessary when the returned Message is an Array.
     fn fromStr(allocator: std.mem.Allocator, raw_message: []const u8) !Self {
         // The first byte tells you what kind of message this is.
         const message_type = try MessageType.fromByte(raw_message[0]);
@@ -157,54 +178,62 @@ const Message = union(MessageType) {
     }
 };
 
-test "parse Message Unknown type" {
+test "parse Message fromStr Unknown type" {
     try testing.expectError(Error.UnknownMessageType, Message.fromStr(testing.allocator, ".cannot parse this\r\n"));
 }
-test "parse Message missing delimiter" {
+test "parse Message fromStr missing delimiter" {
     try testing.expectError(Error.MissingDelimiter, Message.fromStr(testing.allocator, "+I will ramble on forever with no end on and on and on and"));
 }
-test "parse Message SimpleString" {
+test "parse Message fromStr SimpleString" {
     try testing.expectEqualSlices(u8, (try Message.fromStr(testing.allocator, "+\r\n")).simple_string.value, "");
     try testing.expectEqualSlices(u8, (try Message.fromStr(testing.allocator, "+Hi there, my name is Zog!\r\n")).simple_string.value, "Hi there, my name is Zog!");
 }
-test "parse Message BulkString" {
+test "parse Message fromStr BulkString" {
     try testing.expectEqualSlices(u8, (try Message.fromStr(testing.allocator, "$1\r\nx\r\n")).bulk_string.value, "x");
     try testing.expectEqualSlices(u8, "1234567890", (try Message.fromStr(testing.allocator, "$10\r\n1234567890\r\n")).bulk_string.value);
     try testing.expectEqualSlices(u8, "", (try Message.fromStr(testing.allocator, "$-1\r\n")).bulk_string.value);
     try testing.expectEqualSlices(u8, "", (try Message.fromStr(testing.allocator, "$0\r\n\r\n")).bulk_string.value);
 }
-test "parse Message BulkString bad length header" {
+test "parse Message fromStr BulkString bad length header" {
     try testing.expectError(Error.BulkStringBadLengthHeader, Message.fromStr(testing.allocator, "$\r\n\r\n"));
     try testing.expectError(Error.BulkStringBadLengthHeader, Message.fromStr(testing.allocator, "$not_an_int\r\nhibye\r\n"));
     try testing.expectError(Error.BulkStringBadLengthHeader, Message.fromStr(testing.allocator, "$5.0\r\nhibye\r\n"));
 }
-test "parse Message Array bad length header" {
+test "parse Message fromStr Array bad length header" {
     try testing.expectError(Error.ArrayBadLengthHeader, Message.fromStr(testing.allocator, "*\r\n+NOK\r\n"));
     try testing.expectError(Error.ArrayBadLengthHeader, Message.fromStr(testing.allocator, "*this isn't a number\r\n+OK\r\n"));
     try testing.expectError(Error.ArrayBadLengthHeader, Message.fromStr(testing.allocator, "*-1\r\n+OK\r\n"));
     try testing.expectError(Error.ArrayBadLengthHeader, Message.fromStr(testing.allocator, "*1.0\r\n+OK\r\n"));
 }
-test "parse Message Array invalid nested message" {
+test "parse Message fromStr Array invalid nested message" {
     try testing.expectError(Error.ArrayInvalidNestedMessage, Message.fromStr(testing.allocator, "*1\r\n*1\r\n+OK\r\n"));
     try testing.expectError(Error.ArrayInvalidNestedMessage, Message.fromStr(testing.allocator, "*2\r\n$2\r\nhi\r\n*1\r\n+OK\r\n"));
 }
-test "parse Message Array" {
-    // var m1 = try Message.fromStr(testing.allocator, "*0\r\n");
-    // defer m1.deinit();
-    // try testing.expectEqual(0, m1.array.elements.len);
-    // var m2 = try Message.fromStr(testing.allocator, "*1\r\n+OK\r\n");
-    // defer m2.deinit();
-    // try testing.expectEqual(1, m2.array.elements.len);
-    // try testing.expectEqual(Message{ .simple_string = .{ .value = "OK" } }, m2.array.elements[0]);
-    // var m3 = try Message.fromStr(testing.allocator, "*1\r\n$4\r\nhiya\r\n");
-    // defer m3.deinit();
-    // try testing.expectEqual(1, m3.array.elements.len);
-    // try testing.expectEqual(Message{ .simple_string = .{ .value = "hiya" } }, m3.array.elements[0]);
-    // var m4 = try Message.fromStr(testing.allocator, "*2\r\n$4\r\nnope\r\n+bye");
-    // defer m4.deinit();
-    // try testing.expectEqual(1, m4.array.elements.len);
-    // try testing.expectEqual(Message{ .bulk_string = .{ .value = "nope" } }, m4.array.elements[0]);
-    // try testing.expectEqual(Message{ .simple_string = .{ .value = "bye" } }, m4.array.elements[1]);
+test "parse Message fromStr Array" {
+    {
+        var message = try Message.fromStr(testing.allocator, "*0\r\n");
+        defer message.deinit();
+        try testing.expectEqual(0, message.array.elements.len);
+    }
+    {
+        var message = try Message.fromStr(testing.allocator, "*1\r\n+OK\r\n");
+        defer message.deinit();
+        try testing.expectEqual(1, message.array.elements.len);
+        try testing.expectEqualSlices(u8, "OK", message.array.elements[0].simple_string.value);
+    }
+    {
+        var message = try Message.fromStr(testing.allocator, "*1\r\n$4\r\nhiya\r\n");
+        defer message.deinit();
+        try testing.expectEqual(1, message.array.elements.len);
+        try testing.expectEqualSlices(u8, "hiya", message.array.elements[0].bulk_string.value);
+    }
+    {
+        var message = try Message.fromStr(testing.allocator, "*2\r\n$4\r\nnope\r\n+bye\r\n");
+        defer message.deinit();
+        try testing.expectEqual(2, message.array.elements.len);
+        try testing.expectEqualSlices(u8, "nope", message.array.elements[0].bulk_string.value);
+        try testing.expectEqualSlices(u8, "bye", message.array.elements[1].simple_string.value);
+    }
 }
 
 // Messages from the client are parsed as one of these Requests, which are then processed to produce a Response.
@@ -226,7 +255,6 @@ fn messageToRequest(message: Message) !Request {
 
 pub fn parseRequest(allocator: std.mem.Allocator, raw_message: []const u8) !Request {
     // Parse the raw_message into a Message.
-    // TODO I think we can get away without having to allocate anything for Message or Request. We can just have slices into the raw_message string.
     const message = try Message.fromStr(allocator, raw_message);
     // Parse the Message into a Request.
     return messageToRequest(message);
