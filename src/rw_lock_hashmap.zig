@@ -4,7 +4,7 @@ const Allocator = std.mem.Allocator;
 const stdout = std.io.getStdOut().writer();
 const testing = std.testing;
 
-// Thread-safe hashmap makes copies of and owns the string keys and string values.
+// Thread-safe hashmap that makes copies of and owns the string keys and string values.
 pub const RwLockHashMap = struct {
     const Self = @This();
     const K = []const u8;
@@ -19,15 +19,13 @@ pub const RwLockHashMap = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        // Free the contents of the map, just the parts that we own. i.e. the keys and the string values, but not the ValueTimestampPair, because those are owned by the hashmap itself.
-        if (self.map.unmanaged.size > 0) {
-            var iter = self.map.iterator();
-            while (iter.next()) |entry| {
-                self.map.allocator.free(entry.key_ptr.*);
-                self.map.allocator.free(entry.value_ptr.*.value);
-            }
+        // Free the owned strings that we allocated for the keys and values in the hashmap. We don't free the map itself yet.
+        var iter = self.map.iterator();
+        while (iter.next()) |entry| {
+            self.map.allocator.free(entry.key_ptr.*);
+            self.map.allocator.free(entry.value_ptr.*.value);
         }
-        // Free the map itself.
+        // Free the map itself (this is the header + array of entries it uses to store the key-value slices/pointers).
         self.map.deinit();
         self.* = undefined;
     }
@@ -59,6 +57,7 @@ pub const RwLockHashMap = struct {
         }
     }
 
+    // Get the value behind the given key if it exists AND if it's not expired.
     pub fn get(self: *Self, key: K) ?V {
         self.rwLock.lockShared();
         defer self.rwLock.unlockShared();
@@ -76,6 +75,7 @@ pub const RwLockHashMap = struct {
         return null;
     }
 
+    // Print out the contents of the hash map.
     pub fn print(self: *Self) !void {
         self.rwLock.lockShared();
         defer self.rwLock.unlockShared();

@@ -36,7 +36,7 @@ pub fn build(b: *std.Build) void {
     // Add test step.
     const test_step = b.step("test", "Run the tests");
     // TODO figure out how to properly run all tests defined in all files. We're hardcoding the file names for now.
-    const test_runner = b.addTest(.{ .root_source_file = b.path("src/RwLockHashMap.zig"), .target = target, .optimize = optimize });
+    const test_runner = b.addTest(.{ .root_source_file = b.path("src/rw_lock_hashmap.zig"), .target = target, .optimize = optimize });
     //    // Create a test runner.
     //    const test_runner = b.addTest(.{
     //        .root_source_file = b.path("src/tests.zig"),

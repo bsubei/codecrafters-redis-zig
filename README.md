@@ -10,7 +10,7 @@ This is a WIP Zig solution to the ["Build Your Own Redis" Challenge](https://cod
 
 ## Important
 - [ ] redo parser in a more general way, it's extremely hacky right now
-- [ ] figure out allocation for parser
+- [x] figure out allocation for parser
 
 
 ## Nice-to-haves
