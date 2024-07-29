@@ -24,7 +24,8 @@ const Error = error{
 const SimpleString = struct {
     value: []const u8,
 
-    fn parse(raw_message: []const u8) Error!@This() {
+    const Self = @This();
+    fn fromStr(raw_message: []const u8) Error!Self {
         const rest_of_text = raw_message[1..];
         const index = std.mem.indexOf(u8, rest_of_text, CRLF_DELIMITER);
         if (index) |idx| {
@@ -32,12 +33,16 @@ const SimpleString = struct {
         }
         return Error.MissingDelimiter;
     }
+    fn toStr(self: *const Self, allocator: std.mem.Allocator) Error![]const u8 {
+        return std.fmt.allocPrint(allocator, "+{s}{s}", .{ self.value, CRLF_DELIMITER });
+    }
 };
 
 const BulkString = struct {
     value: []const u8,
 
-    fn parse(raw_message: []const u8) Error!@This() {
+    const Self = @This();
+    fn fromStr(raw_message: []const u8) Error!Self {
         const rest_of_text = raw_message[1..];
         const index_crlf = std.mem.indexOf(u8, rest_of_text, CRLF_DELIMITER);
         if (index_crlf) |idx_crlf| {
@@ -57,12 +62,16 @@ const BulkString = struct {
         }
         return Error.MissingDelimiter;
     }
+    fn toStr(self: *const Self, allocator: std.mem.Allocator) Error![]const u8 {
+        return std.fmt.allocPrint(allocator, "${d}{s}{s}{s}", .{ self.value.len, CRLF_DELIMITER, self.value, CRLF_DELIMITER });
+    }
 };
 const Array = struct {
-    elements: []Message,
+    elements: []const Message,
     allocator: std.mem.Allocator,
 
-    fn parse(allocator: std.mem.Allocator, raw_message: []const u8) Error!@This() {
+    const Self = @This();
+    fn fromStr(allocator: std.mem.Allocator, raw_message: []const u8) Error!Self {
         var rest_of_text = raw_message[1..];
         const index_crlf = std.mem.indexOf(u8, rest_of_text, CRLF_DELIMITER);
         if (index_crlf) |idx_crlf| {
@@ -119,6 +128,27 @@ const Array = struct {
 
         return .{ .elements = try allocator.alloc(Message, 0), .allocator = allocator };
     }
+    fn toStr(self: *const Self, allocator: std.mem.Allocator) Error![]const u8 {
+        // Start out with the header.
+        var final_string = try std.fmt.allocPrint(allocator, "*{d}{s}", .{
+            self.elements.len,
+            CRLF_DELIMITER,
+        });
+
+        // Keep appending to the final_string as we see each new message.
+        for (self.elements) |message| {
+            // This message string is temporary and not needed once we concatenate it using allocPrint.
+            const msg_str = try message.toStr(allocator);
+            defer allocator.free(msg_str);
+
+            // Append this message's string contents to the final string.
+            const tmp = try std.fmt.allocPrint(allocator, "{s}{s}", .{ final_string, msg_str });
+            // Get rid of the old "final string" and set the new one.
+            allocator.free(final_string);
+            final_string = tmp;
+        }
+        return final_string;
+    }
 };
 
 const MessageType = enum {
@@ -135,6 +165,7 @@ const MessageType = enum {
         };
     }
 };
+// Does not own the underlying contents (strings).
 const Message = union(MessageType) {
     simple_string: SimpleString,
     bulk_string: BulkString,
@@ -142,6 +173,7 @@ const Message = union(MessageType) {
 
     const Self = @This();
 
+    // Frees only the Message slice when this Message is an Array. Does not free the contents (strings), since those are not owned by the Messages.
     pub fn deinit(self: *Self) void {
         switch (self.*) {
             .array => {
@@ -150,14 +182,6 @@ const Message = union(MessageType) {
             },
             else => return,
         }
-    }
-    fn parse(allocator: std.mem.Allocator, raw_message: []const u8, message_type: MessageType) !Self {
-        // TODO less boilerplate, probably using builtins
-        return switch (message_type) {
-            .simple_string => .{ .simple_string = try SimpleString.parse(raw_message) },
-            .bulk_string => .{ .bulk_string = try BulkString.parse(raw_message) },
-            .array => .{ .array = try Array.parse(allocator, raw_message) },
-        };
     }
     // Caller is responsible for calling deinit() on returned Message, which is only strictly necessary when the returned Message is an Array.
     fn fromStr(allocator: std.mem.Allocator, raw_message: []const u8) !Self {
@@ -168,13 +192,27 @@ const Message = union(MessageType) {
         // +OK\r\n --> this is a SimpleString containing "OK".
         // $5\r\nhello\r\n --> this is a BulkString containing "hello".
         // *2\r\n$2\r\nhi\r\n$3\r\nbye\r\n --> this is an Array with two BulkStrings: first one contains "hi" and the second contains "bye".
-        return parse(allocator, raw_message, message_type);
+
+        // TODO less boilerplate, probably using builtins
+        return switch (message_type) {
+            .simple_string => return .{ .simple_string = try SimpleString.fromStr(raw_message) },
+            .bulk_string => return .{ .bulk_string = try BulkString.fromStr(raw_message) },
+            .array => return .{ .array = try Array.fromStr(allocator, raw_message) },
+        };
     }
     // Caller owns returned string.
-    fn toStr(self: *Self, allocator: std.mem.Allocator) ![]const u8 {
-        _ = self;
-        _ = allocator;
-        return error.UnimplementedError;
+    fn toStr(self: *const Self, allocator: std.mem.Allocator) Error![]const u8 {
+        switch (self.*) {
+            .simple_string => {
+                return self.simple_string.toStr(allocator);
+            },
+            .bulk_string => {
+                return self.bulk_string.toStr(allocator);
+            },
+            .array => {
+                return self.array.toStr(allocator);
+            },
+        }
     }
 };
 
@@ -185,11 +223,11 @@ test "parse Message fromStr missing delimiter" {
     try testing.expectError(Error.MissingDelimiter, Message.fromStr(testing.allocator, "+I will ramble on forever with no end on and on and on and"));
 }
 test "parse Message fromStr SimpleString" {
-    try testing.expectEqualSlices(u8, (try Message.fromStr(testing.allocator, "+\r\n")).simple_string.value, "");
-    try testing.expectEqualSlices(u8, (try Message.fromStr(testing.allocator, "+Hi there, my name is Zog!\r\n")).simple_string.value, "Hi there, my name is Zog!");
+    try testing.expectEqualSlices(u8, "", (try Message.fromStr(testing.allocator, "+\r\n")).simple_string.value);
+    try testing.expectEqualSlices(u8, "Hi there, my name is Zog!", (try Message.fromStr(testing.allocator, "+Hi there, my name is Zog!\r\n")).simple_string.value);
 }
 test "parse Message fromStr BulkString" {
-    try testing.expectEqualSlices(u8, (try Message.fromStr(testing.allocator, "$1\r\nx\r\n")).bulk_string.value, "x");
+    try testing.expectEqualSlices(u8, "x", (try Message.fromStr(testing.allocator, "$1\r\nx\r\n")).bulk_string.value);
     try testing.expectEqualSlices(u8, "1234567890", (try Message.fromStr(testing.allocator, "$10\r\n1234567890\r\n")).bulk_string.value);
     try testing.expectEqualSlices(u8, "", (try Message.fromStr(testing.allocator, "$-1\r\n")).bulk_string.value);
     try testing.expectEqualSlices(u8, "", (try Message.fromStr(testing.allocator, "$0\r\n\r\n")).bulk_string.value);
@@ -234,6 +272,58 @@ test "parse Message fromStr Array" {
         try testing.expectEqualSlices(u8, "nope", message.array.elements[0].bulk_string.value);
         try testing.expectEqualSlices(u8, "bye", message.array.elements[1].simple_string.value);
     }
+}
+test "Message toStr SimpleString" {
+    {
+        const message = Message{ .simple_string = .{ .value = "hello" } };
+        const msg_str = try message.toStr(testing.allocator);
+        defer testing.allocator.free(msg_str);
+        try testing.expectEqualSlices(u8, "+hello\r\n", msg_str);
+    }
+}
+test "Message toStr BulkString" {
+    {
+        const message = Message{ .bulk_string = .{ .value = "hello" } };
+        const msg_str = try message.toStr(testing.allocator);
+        defer testing.allocator.free(msg_str);
+        try testing.expectEqualSlices(u8, "$5\r\nhello\r\n", msg_str);
+    }
+}
+test "Message toStr Array" {
+    {
+        const first = Message{ .bulk_string = .{ .value = "first" } };
+        const last = Message{ .simple_string = .{ .value = "last" } };
+        const message = Message{ .array = .{ .elements = &[_]Message{ first, last }, .allocator = testing.allocator } };
+        const msg_str = try message.toStr(testing.allocator);
+        defer testing.allocator.free(msg_str);
+        try testing.expectEqualSlices(u8, "*2\r\n$5\r\nfirst\r\n+last\r\n", msg_str);
+    }
+}
+test "Message roundtrip SimpleString" {
+    const msg = Message{ .simple_string = .{ .value = "last" } };
+    const msg_str = try msg.toStr(testing.allocator);
+    defer testing.allocator.free(msg_str);
+    const msg_again = try Message.fromStr(testing.allocator, msg_str);
+    try testing.expectEqualSlices(u8, msg.simple_string.value, msg_again.simple_string.value);
+}
+test "Message roundtrip BulkString" {
+    const msg = Message{ .bulk_string = .{ .value = "arbitrary" } };
+    const msg_str = try msg.toStr(testing.allocator);
+    defer testing.allocator.free(msg_str);
+    const msg_again = try Message.fromStr(testing.allocator, msg_str);
+    try testing.expectEqualSlices(u8, msg.bulk_string.value, msg_again.bulk_string.value);
+}
+test "Message roundtrip Array" {
+    const first = Message{ .bulk_string = .{ .value = "first" } };
+    const last = Message{ .simple_string = .{ .value = "last" } };
+    const msg = Message{ .array = .{ .elements = &[_]Message{ first, last }, .allocator = testing.allocator } };
+    const msg_str = try msg.toStr(testing.allocator);
+    defer testing.allocator.free(msg_str);
+    var msg_again = try Message.fromStr(testing.allocator, msg_str);
+    defer msg_again.deinit();
+    try testing.expectEqual(msg.array.elements.len, msg_again.array.elements.len);
+    try testing.expectEqualSlices(u8, msg.array.elements[0].bulk_string.value, msg_again.array.elements[0].bulk_string.value);
+    try testing.expectEqualSlices(u8, msg.array.elements[1].simple_string.value, msg_again.array.elements[1].simple_string.value);
 }
 
 // Messages from the client are parsed as one of these Requests, which are then processed to produce a Response.
