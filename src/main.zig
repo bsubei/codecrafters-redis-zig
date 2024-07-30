@@ -34,6 +34,7 @@ fn handleClient(client_connection: net.Server.Connection, cache: *Cache) !void {
         }
         // Parse the raw_message into a Request (a command from the client).
         const request = try parser.parseRequest(allocator, raw_message.items);
+        defer request.deinit();
 
         // Handle the Request (update state).
         try parser.handleRequest(request, cache);

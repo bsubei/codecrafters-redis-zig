@@ -15,6 +15,9 @@ const Error = error{
     ArrayBadLengthHeader,
     ArrayInvalidNestedMessage,
     OutOfMemory,
+    InvalidRequest,
+    InvalidRequestEmptyMessage,
+    InvalidRequestExtraArgs,
 };
 
 // Bytes coming in from the client socket are first parsed as a Message, which is then further interpreted as a
@@ -214,6 +217,14 @@ const Message = union(MessageType) {
             },
         }
     }
+
+    fn get_contents(self: *const Self) Error![]const u8 {
+        return switch (self.*) {
+            .simple_string => |s| s.value,
+            .bulk_string => |b| b.value,
+            else => return Error.ArrayInvalidNestedMessage,
+        };
+    }
 };
 
 test "parse Message fromStr Unknown type" {
@@ -325,29 +336,120 @@ test "Message roundtrip Array" {
     try testing.expectEqualSlices(u8, msg.array.elements[0].bulk_string.value, msg_again.array.elements[0].bulk_string.value);
     try testing.expectEqualSlices(u8, msg.array.elements[1].simple_string.value, msg_again.array.elements[1].simple_string.value);
 }
+test "parseRequest PingCommand" {
+    {
+        var request = try parseRequest(testing.allocator, "*1\r\n$4\r\nPING\r\n");
+        defer request.deinit();
+        try testing.expect(request.command.ping.contents == null);
+    }
+    {
+        var request = try parseRequest(testing.allocator, "*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n");
+        defer request.deinit();
+        try testing.expectEqualSlices(u8, "hello", request.command.ping.contents.?);
+    }
+}
+test "parseRequest GetCommand" {
+    {
+        // var request = try parseRequest(testing.allocator, "*2\r\n$3\r\nGet\r\n$3\r\nbye\r\n");
+        // defer request.deinit();
+        // try testing.expectEqualSlices(u8, "bye", request.command.get.key);
+    }
+}
+test "parseRequest SetCommand" {
+    {
+        // var request = try parseRequest(testing.allocator, "*2\r\n$3\r\nsEt\r\n$4\r\nfour\r\n$1\r\n4\r\n");
+        // defer request.deinit();
+        // try testing.expectEqualSlices(u8, "four", request.command.set.key);
+        // try testing.expectEqualSlices(u8, "4", request.command.set.value);
+        // try testing.expect(request.command.set.expiry == null);
+    }
+    {
+        // var request = try parseRequest(testing.allocator, "*2\r\n$3\r\nsEt\r\n$4\r\nfour\r\n$1\r\n4\r\nPx\r\n1234\r\n");
+        // defer request.deinit();
+        // try testing.expectEqualSlices(u8, "four", request.command.set.key);
+        // try testing.expectEqualSlices(u8, "4", request.command.set.value);
+        // try testing.expect(request.command.set.expiry.? == 1234);
+    }
+}
+// TODO test errors for parseRequest
 
 // Messages from the client are parsed as one of these Requests, which are then processed to produce a Response.
 const PingCommand = struct { contents: ?[]const u8 };
 const EchoCommand = struct { contents: []const u8 };
 const SetCommand = struct { key: []const u8, value: []const u8, expiry: Cache.ExpiryTimestampMs };
 const GetCommand = struct { key: []const u8 };
-const Request = union(enum) {
+const CommandType = enum {
+    ping,
+    echo,
+    set,
+    get,
+};
+const Command = union(CommandType) {
     ping: PingCommand,
     echo: EchoCommand,
     set: SetCommand,
     get: GetCommand,
 };
 
-fn messageToRequest(message: Message) !Request {
-    _ = message;
-    return error.UnimplementedError;
+const Request = struct {
+    allocator: std.mem.Allocator,
+    command: Command,
+
+    const Self = @This();
+    fn deinit(self: *Self) void {
+        switch (self.command) {
+            .ping => |p| {
+                if (p.contents != null) self.allocator.free(p.contents.?);
+            },
+            .echo => |e| {
+                self.allocator.free(e.contents);
+            },
+            .set => |s| {
+                self.allocator.free(s.key);
+                self.allocator.free(s.value);
+            },
+            .get => |g| {
+                self.allocator.free(g.key);
+            },
+        }
+    }
+};
+
+fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
+    switch (message) {
+        .array => {
+            const messages = message.array.elements;
+            if (messages.len == 0) return Error.InvalidRequestEmptyMessage;
+            // The first word is the command. Assume the message elements are not Arrays.
+            const first_word = try messages[0].get_contents();
+
+            // TODO surely I can get a comptime func to match against the first_word here? Or at least just get the name of the enum field
+            if (std.ascii.eqlIgnoreCase(first_word, "ping")) {
+                switch (messages.len) {
+                    1 => return Request{ .command = Command{ .ping = .{ .contents = null } }, .allocator = undefined },
+                    2 => return Request{ .command = Command{ .ping = .{ .contents = @as(?[]const u8, try allocator.dupe(u8, try messages[1].get_contents())) } }, .allocator = allocator },
+                    else => {
+                        return Error.InvalidRequestExtraArgs;
+                    },
+                }
+            }
+        },
+        else => {
+            // TODO think about implementing simple_string or bulk_string as a request.
+            return error.UnimplementedError;
+        },
+    }
+    return Error.InvalidRequest;
 }
 
+// TODO message needs to be cleaned up. but Request relies on having slices from Message.
 pub fn parseRequest(allocator: std.mem.Allocator, raw_message: []const u8) !Request {
-    // Parse the raw_message into a Message.
-    const message = try Message.fromStr(allocator, raw_message);
+    // Parse the raw_message into a Message. Make sure to free the message contents when we're done using it.
+    var message = try Message.fromStr(allocator, raw_message);
+    defer message.deinit();
+
     // Parse the Message into a Request.
-    return messageToRequest(message);
+    return messageToRequest(allocator, message);
 }
 
 pub fn handleRequest(request: Request, cache: *Cache) !void {
