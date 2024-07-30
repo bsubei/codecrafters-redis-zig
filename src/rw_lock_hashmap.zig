@@ -89,6 +89,9 @@ pub const RwLockHashMap = struct {
     }
 
     pub fn count(self: *Self) @TypeOf(self.map).Size {
+        self.rwLock.lockShared();
+        defer self.rwLock.unlockShared();
+
         return self.map.count();
     }
 };
