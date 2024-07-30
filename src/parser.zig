@@ -497,8 +497,49 @@ test "parseRequest SetCommand" {
 // TODO test errors for parseRequest
 
 pub fn handleRequest(request: Request, cache: *Cache) !void {
-    _ = request;
-    _ = cache;
+    // We only need to update state for SET commands. Everything else is ignored here.
+    switch (request.command) {
+        .set => |s| {
+            try cache.putWithExpiry(s.key, s.value, s.expiry);
+        },
+        else => {},
+    }
+}
+test "handleRequest no effect" {
+    var cache = Cache.init(testing.allocator);
+    try testing.expectEqual(0, cache.count());
+    {
+        const request = Request{ .allocator = undefined, .command = Command{ .echo = EchoCommand{ .contents = "can you hear me?" } } };
+        try handleRequest(request, &cache);
+        try testing.expectEqual(0, cache.count());
+    }
+    {
+        const request = Request{ .allocator = undefined, .command = Command{ .get = GetCommand{ .key = "does not exist" } } };
+        try handleRequest(request, &cache);
+        try testing.expectEqual(0, cache.count());
+    }
+}
+test "handleRequest SetCommand" {
+    var cache = Cache.init(testing.allocator);
+    defer cache.deinit();
+
+    try testing.expectEqual(0, cache.count());
+    {
+        const request = Request{ .allocator = undefined, .command = Command{ .set = SetCommand{ .key = "key1", .value = "value1", .expiry = null } } };
+        try handleRequest(request, &cache);
+        try testing.expectEqual(1, cache.count());
+        try testing.expectEqualSlices(u8, "value1", cache.get("key1").?);
+    }
+    {
+        // NOTE: even though it's usually a bad idea to write unit tests that depend on timing, this should be fine since we're putting in
+        // a big negative expiry. It's unlikely that the system clock will jump back by more than 100 days in the past in between calling cache.putWithExpiry() and cache.get().
+        const request = Request{ .allocator = undefined, .command = Command{ .set = SetCommand{ .key = "key1", .value = "value1000", .expiry = -100 * std.time.ms_per_day } } };
+        try handleRequest(request, &cache);
+        // Replacing the same key with a new value should result in the same count.
+        try testing.expectEqual(1, cache.count());
+        // The value should be expired.
+        try testing.expectEqual(null, cache.get("key1"));
+    }
 }
 
 // Caller owns returned Message.
