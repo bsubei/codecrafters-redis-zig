@@ -17,7 +17,7 @@ const Error = error{
     OutOfMemory,
     InvalidRequest,
     InvalidRequestEmptyMessage,
-    InvalidRequestExtraArgs,
+    InvalidRequestNumberOfArgs,
 };
 
 // Bytes coming in from the client socket are first parsed as a Message, which is then further interpreted as a
@@ -336,42 +336,6 @@ test "Message roundtrip Array" {
     try testing.expectEqualSlices(u8, msg.array.elements[0].bulk_string.value, msg_again.array.elements[0].bulk_string.value);
     try testing.expectEqualSlices(u8, msg.array.elements[1].simple_string.value, msg_again.array.elements[1].simple_string.value);
 }
-test "parseRequest PingCommand" {
-    {
-        var request = try parseRequest(testing.allocator, "*1\r\n$4\r\nPING\r\n");
-        defer request.deinit();
-        try testing.expect(request.command.ping.contents == null);
-    }
-    {
-        var request = try parseRequest(testing.allocator, "*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n");
-        defer request.deinit();
-        try testing.expectEqualSlices(u8, "hello", request.command.ping.contents.?);
-    }
-}
-test "parseRequest GetCommand" {
-    {
-        // var request = try parseRequest(testing.allocator, "*2\r\n$3\r\nGet\r\n$3\r\nbye\r\n");
-        // defer request.deinit();
-        // try testing.expectEqualSlices(u8, "bye", request.command.get.key);
-    }
-}
-test "parseRequest SetCommand" {
-    {
-        // var request = try parseRequest(testing.allocator, "*2\r\n$3\r\nsEt\r\n$4\r\nfour\r\n$1\r\n4\r\n");
-        // defer request.deinit();
-        // try testing.expectEqualSlices(u8, "four", request.command.set.key);
-        // try testing.expectEqualSlices(u8, "4", request.command.set.value);
-        // try testing.expect(request.command.set.expiry == null);
-    }
-    {
-        // var request = try parseRequest(testing.allocator, "*2\r\n$3\r\nsEt\r\n$4\r\nfour\r\n$1\r\n4\r\nPx\r\n1234\r\n");
-        // defer request.deinit();
-        // try testing.expectEqualSlices(u8, "four", request.command.set.key);
-        // try testing.expectEqualSlices(u8, "4", request.command.set.value);
-        // try testing.expect(request.command.set.expiry.? == 1234);
-    }
-}
-// TODO test errors for parseRequest
 
 // Messages from the client are parsed as one of these Requests, which are then processed to produce a Response.
 const PingCommand = struct { contents: ?[]const u8 };
@@ -429,7 +393,44 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
                     1 => return Request{ .command = Command{ .ping = .{ .contents = null } }, .allocator = undefined },
                     2 => return Request{ .command = Command{ .ping = .{ .contents = @as(?[]const u8, try allocator.dupe(u8, try messages[1].get_contents())) } }, .allocator = allocator },
                     else => {
-                        return Error.InvalidRequestExtraArgs;
+                        return Error.InvalidRequestNumberOfArgs;
+                    },
+                }
+            }
+            if (std.ascii.eqlIgnoreCase(first_word, "echo")) {
+                switch (messages.len) {
+                    2 => return Request{ .command = Command{ .echo = .{ .contents = try allocator.dupe(u8, try messages[1].get_contents()) } }, .allocator = allocator },
+                    else => {
+                        return Error.InvalidRequestNumberOfArgs;
+                    },
+                }
+            }
+            if (std.ascii.eqlIgnoreCase(first_word, "get")) {
+                switch (messages.len) {
+                    2 => return Request{ .command = Command{ .get = .{ .key = try allocator.dupe(u8, try messages[1].get_contents()) } }, .allocator = allocator },
+                    else => {
+                        return Error.InvalidRequestNumberOfArgs;
+                    },
+                }
+            }
+            if (std.ascii.eqlIgnoreCase(first_word, "set")) {
+                switch (messages.len) {
+                    3, 5 => {
+                        const key = try allocator.dupe(u8, try messages[1].get_contents());
+                        errdefer allocator.free(key);
+                        const value = try allocator.dupe(u8, try messages[2].get_contents());
+                        errdefer allocator.free(value);
+
+                        // If PX and timestamp are provided, also set the expiry field.
+                        const expiry = if (messages.len == 5 and std.ascii.eqlIgnoreCase(try messages[3].get_contents(), "px"))
+                            try std.fmt.parseInt(i64, try messages[4].get_contents(), 10)
+                        else
+                            null;
+
+                        return Request{ .command = Command{ .set = .{ .key = key, .value = value, .expiry = expiry } }, .allocator = allocator };
+                    },
+                    else => {
+                        return Error.InvalidRequestNumberOfArgs;
                     },
                 }
             }
@@ -451,6 +452,49 @@ pub fn parseRequest(allocator: std.mem.Allocator, raw_message: []const u8) !Requ
     // Parse the Message into a Request.
     return messageToRequest(allocator, message);
 }
+test "parseRequest PingCommand" {
+    {
+        var request = try parseRequest(testing.allocator, "*1\r\n$4\r\nPING\r\n");
+        defer request.deinit();
+        try testing.expect(request.command.ping.contents == null);
+    }
+    {
+        var request = try parseRequest(testing.allocator, "*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n");
+        defer request.deinit();
+        try testing.expectEqualSlices(u8, "hello", request.command.ping.contents.?);
+    }
+}
+test "parseRequest EchoCommand" {
+    {
+        var request = try parseRequest(testing.allocator, "*2\r\n$4\r\nEChO\r\n$3\r\nbye\r\n");
+        defer request.deinit();
+        try testing.expectEqualSlices(u8, "bye", request.command.echo.contents);
+    }
+}
+test "parseRequest GetCommand" {
+    {
+        var request = try parseRequest(testing.allocator, "*2\r\n$3\r\nGet\r\n$3\r\nbye\r\n");
+        defer request.deinit();
+        try testing.expectEqualSlices(u8, "bye", request.command.get.key);
+    }
+}
+test "parseRequest SetCommand" {
+    {
+        var request = try parseRequest(testing.allocator, "*3\r\n$3\r\nsEt\r\n$4\r\nfour\r\n$1\r\n4\r\n");
+        defer request.deinit();
+        try testing.expectEqualSlices(u8, "four", request.command.set.key);
+        try testing.expectEqualSlices(u8, "4", request.command.set.value);
+        try testing.expect(request.command.set.expiry == null);
+    }
+    {
+        var request = try parseRequest(testing.allocator, "*5\r\n$3\r\nsEt\r\n$4\r\nfour\r\n$4\r\nFOUR\r\n$2\r\nPx\r\n$4\r\n1234\r\n");
+        defer request.deinit();
+        try testing.expectEqualSlices(u8, "four", request.command.set.key);
+        try testing.expectEqualSlices(u8, "FOUR", request.command.set.value);
+        try testing.expectEqual(1234, request.command.set.expiry.?);
+    }
+}
+// TODO test errors for parseRequest
 
 pub fn handleRequest(request: Request, cache: *Cache) !void {
     _ = request;
