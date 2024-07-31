@@ -18,6 +18,7 @@ const Error = error{
     InvalidRequest,
     InvalidRequestEmptyMessage,
     InvalidRequestNumberOfArgs,
+    UnimplementedNonArrayRequest,
 };
 
 // Bytes coming in from the client socket are first parsed as a Message, which is then further interpreted as a
@@ -66,6 +67,10 @@ const BulkString = struct {
         return Error.MissingDelimiter;
     }
     fn toStr(self: *const Self, allocator: std.mem.Allocator) Error![]const u8 {
+        // Special case, handle null bulk string.
+        if (self.value.len == 0) {
+            return std.fmt.allocPrint(allocator, "$-1{s}", .{CRLF_DELIMITER});
+        }
         return std.fmt.allocPrint(allocator, "${d}{s}{s}{s}", .{ self.value.len, CRLF_DELIMITER, self.value, CRLF_DELIMITER });
     }
 };
@@ -299,6 +304,12 @@ test "Message toStr BulkString" {
         defer testing.allocator.free(msg_str);
         try testing.expectEqualSlices(u8, "$5\r\nhello\r\n", msg_str);
     }
+    {
+        const message = Message{ .bulk_string = .{ .value = "" } };
+        const msg_str = try message.toStr(testing.allocator);
+        defer testing.allocator.free(msg_str);
+        try testing.expectEqualSlices(u8, "$-1\r\n", msg_str);
+    }
 }
 test "Message toStr Array" {
     {
@@ -360,7 +371,7 @@ const Request = struct {
     command: Command,
 
     const Self = @This();
-    fn deinit(self: *Self) void {
+    pub fn deinit(self: *Self) void {
         switch (self.command) {
             .ping => |p| {
                 if (p.contents != null) self.allocator.free(p.contents.?);
@@ -437,13 +448,12 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
         },
         else => {
             // TODO think about implementing simple_string or bulk_string as a request.
-            return error.UnimplementedError;
+            return Error.UnimplementedNonArrayRequest;
         },
     }
     return Error.InvalidRequest;
 }
 
-// TODO message needs to be cleaned up. but Request relies on having slices from Message.
 pub fn parseRequest(allocator: std.mem.Allocator, raw_message: []const u8) !Request {
     // Parse the raw_message into a Message. Make sure to free the message contents when we're done using it.
     var message = try Message.fromStr(allocator, raw_message);
@@ -542,20 +552,39 @@ test "handleRequest SetCommand" {
     }
 }
 
-// Caller owns returned Message.
-fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Cache) !*Message {
-    _ = allocator;
-    _ = request;
-    _ = cache;
+// NOTE: because we don't write out Array Messages, we don't need to allocate the Message.
+fn getResponseMessage(request: Request, cache: *Cache) !Message {
+    switch (request.command) {
+        .ping => |p| {
+            if (p.contents) |text| {
+                return Message{ .bulk_string = .{ .value = text } };
+            }
+            return Message{ .simple_string = .{ .value = "PONG" } };
+        },
+        .echo => |e| {
+            return Message{ .bulk_string = .{ .value = e.contents } };
+        },
+        .get => |g| {
+            const value = cache.get(g.key);
+            if (value) |v| {
+                return Message{ .bulk_string = .{ .value = v } };
+            }
+            return Message{ .bulk_string = .{ .value = "" } };
+        },
+        .set => {
+            return Message{ .simple_string = .{ .value = "OK" } };
+        },
+    }
     return error.UnimplementedError;
 }
 
 // Caller owns returned string.
 pub fn getResponse(allocator: std.mem.Allocator, request: Request, cache: *Cache) ![]const u8 {
-    const response_message = try getResponseMessage(allocator, request, cache);
-    defer allocator.destroy(response_message);
+    const response_message = try getResponseMessage(request, cache);
     return response_message.toStr(allocator);
 }
+
+// TODO test getResponse
 
 pub fn readChunk(client_connection: net.Server.Connection, message_ptr: *std.ArrayList(u8)) !usize {
     // Read one chunk.
@@ -572,105 +601,3 @@ pub fn readChunk(client_connection: net.Server.Connection, message_ptr: *std.Arr
 
     return num_read_bytes;
 }
-
-// The server produces and sends a Response back to the client.
-const Response = []const u8;
-// TODO implement proper parsing. For now, we're just assuming the structure of incoming messages look like this:
-// *2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n
-// fn getResponseOld(allocator: std.mem.Allocator, request: []const u8, cache: *Cache) !Response {
-//     var it = std.mem.tokenizeSequence(u8, request, "\r\n");
-//     var i: u32 = 0;
-//
-//     var command: ?Request = null;
-//
-//     while (it.next()) |word| : (i += 1) {
-//         if (command) |cmd| {
-//             switch (cmd) {
-//                 .echo => |echo| {
-//                     if (i == echo.index + 2) {
-//                         // TODO create a make_response function to make this less ugly.
-//                         const buf = try allocator.alloc(u8, word.len + 3);
-//                         return try std.fmt.bufPrint(buf, "+{s}\r\n", .{word});
-//                     }
-//                 },
-//                 .set => |set| {
-//                     if (i == set.index + 2) {
-//                         // Record the requested KEY
-//                         // NOTE: this is ok since word is a slice originating from the "request" slice. Its lifetime should be the lifetime of this function.
-//                         command.?.set.key = word;
-//                         continue;
-//                     } else if (i == set.index + 4) {
-//                         // Record the requested VALUE
-//                         command.?.set.value = word;
-//                         continue;
-//                     } else if (i == set.index + 6) {
-//                         // Check for an expiry argument.
-//                         if (std.ascii.eqlIgnoreCase(word, "px")) {
-//                             command.?.set.expiry = word;
-//                             continue;
-//                         }
-//                     } else if (i == set.index + 8) {
-//                         // Store the key-value with an expiry.
-//                         if (set.expiry) |_| {
-//                             const expiry_ms = try std.fmt.parseInt(i64, word, 10);
-//                             const now_ms = std.time.milliTimestamp();
-//                             const expiry_timestamp = now_ms + expiry_ms;
-//                             try cache.putWithExpiry(set.key.?, set.value.?, @as(?i64, expiry_timestamp));
-//                         } else {
-//                             return Error.MissingExpiryArgument;
-//                         }
-//                         return "+OK\r\n";
-//                     }
-//                 },
-//                 .get => |get| {
-//                     if (i == get.index + 2) {
-//                         const value = cache.get(word);
-//                         if (value) |val| {
-//                             var buf: [1024]u8 = undefined;
-//                             const filled = try std.fmt.bufPrint(&buf, "${d}\r\n{s}\r\n", .{ val.len, val });
-//                             const response = try allocator.alloc(u8, filled.len);
-//                             std.mem.copyForwards(u8, response, filled);
-//                             return response;
-//                         }
-//                         return "$-1\r\n";
-//                     }
-//                 },
-//                 else => {},
-//             }
-//         }
-//         if (std.ascii.eqlIgnoreCase(word, "echo")) {
-//             // We know it's an echo command, but we don't know the arg yet.
-//             command = .{ .echo = EchoCommand{ .index = i } };
-//             continue;
-//         }
-//         if (std.ascii.eqlIgnoreCase(word, "ping")) {
-//             // TODO Ping could have an attached message, handle that (can't return early always).
-//             return "+PONG\r\n";
-//         }
-//         if (std.ascii.eqlIgnoreCase(word, "set")) {
-//             // We know it's a set command, but we don't know the args yet.
-//             command = .{ .set = SetCommand{ .index = i, .key = null, .value = null, .expiry = null } };
-//             continue;
-//         }
-//         if (std.ascii.eqlIgnoreCase(word, "get")) {
-//             // We know it's a get command, but we don't know the arg yet.
-//             command = .{ .get = GetCommand{ .index = i } };
-//             continue;
-//         }
-//     }
-//     // Leftover, was looking for px for SET command but found none.
-//     // Store the key-value without an expiry.
-//     if (command) |cmd| {
-//         switch (cmd) {
-//             .set => |set| {
-//                 try cache.put(set.key.?, set.value.?);
-//                 return "+OK\r\n";
-//             },
-//             else => {},
-//         }
-//     }
-//
-//     // TODO reply with OK if we don't understand. This is necessary for now because "redis-cli" sometimes sends the COMMANDS command which we don't understand.
-//     return "+OK\r\n";
-// }
-//

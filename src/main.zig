@@ -3,6 +3,52 @@ const net = std.net;
 const stdout = std.io.getStdOut().writer();
 const Cache = @import("rw_lock_hashmap.zig").RwLockHashMap;
 const parser = @import("parser.zig");
+const testing = std.testing;
+
+fn handleRequestAndRespond(allocator: std.mem.Allocator, raw_message: []const u8, cache: *Cache, client_stream: anytype) !void {
+    // Parse the raw_message into a Request (a command from the client).
+    var request = try parser.parseRequest(allocator, raw_message);
+    defer request.deinit();
+
+    // Handle the Request (update state).
+    try parser.handleRequest(request, cache);
+
+    // Generate a Response to the Request as a string.
+    const response_str = try parser.getResponse(allocator, request, cache);
+    defer allocator.free(response_str);
+
+    // Send the Response back to the client.
+    try client_stream.writeAll(response_str);
+}
+
+test "handleRequestAndRespond" {
+    var cache = Cache.init(testing.allocator);
+    defer cache.deinit();
+    {
+        var buffer: [64]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buffer);
+        try handleRequestAndRespond(testing.allocator, "*2\r\n$4\r\nECHO\r\n$13\r\nHello, world!\r\n", &cache, fbs.writer());
+        try testing.expectEqualSlices(u8, "$13\r\nHello, world!\r\n", fbs.getWritten());
+    }
+    {
+        var buffer: [64]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buffer);
+        try handleRequestAndRespond(testing.allocator, "*2\r\n$3\r\ngEt\r\n$13\r\nHello, world!\r\n", &cache, fbs.writer());
+        try testing.expectEqualSlices(u8, "$-1\r\n", fbs.getWritten());
+    }
+    {
+        var buffer: [64]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buffer);
+        try handleRequestAndRespond(testing.allocator, "*3\r\n$3\r\nSEt\r\n$13\r\nHello, world!\r\n$4\r\nbye!\r\n", &cache, fbs.writer());
+        try testing.expectEqualSlices(u8, "+OK\r\n", fbs.getWritten());
+    }
+    {
+        var buffer: [64]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buffer);
+        try handleRequestAndRespond(testing.allocator, "*2\r\n$3\r\ngEt\r\n$13\r\nHello, world!\r\n", &cache, fbs.writer());
+        try testing.expectEqualSlices(u8, "$4\r\nbye!\r\n", fbs.getWritten());
+    }
+}
 
 fn handleClient(client_connection: net.Server.Connection, cache: *Cache) !void {
     defer client_connection.stream.close();
@@ -14,12 +60,11 @@ fn handleClient(client_connection: net.Server.Connection, cache: *Cache) !void {
 
     // Because the client will send data and wait for our reply before closing the socket connection, we can't just "read all bytes" from the stream
     // then parse them at our leisure, since we would block forever waiting for end of stream which will never come.
-    // The clean alternative would be to read until seeing a delimiter ('\n' for example) or eof, but misbehaving clients could misbehave and not send either and block us forever.
+    // The clean alternative would be to read until seeing a delimiter ('\n' for example) or eof, but misbehaving clients could just not send either and block us forever.
     // Since I don't know how to make those calls use timeouts, I'll just call read() one chunk at a time (nonblocking) and concatenate them into the final message.
     var raw_message = std.ArrayList(u8).init(allocator);
     // No need to dealloc since we're using an arena allocator.
 
-    // TODO can't we fold all this logic for creating a request from the client_connection into one function?
     while (true) {
         // Read one chunk and append it to the raw_message.
         const num_read_bytes = try parser.readChunk(client_connection, &raw_message);
@@ -32,20 +77,8 @@ fn handleClient(client_connection: net.Server.Connection, cache: *Cache) !void {
         if (num_read_bytes == parser.CLIENT_READER_CHUNK_SIZE) {
             continue;
         }
-        // Parse the raw_message into a Request (a command from the client).
-        const request = try parser.parseRequest(allocator, raw_message.items);
-        defer request.deinit();
 
-        // Handle the Request (update state).
-        try parser.handleRequest(request, cache);
-
-        // Generate a Response to the Request as a string.
-        const response_str = try parser.getResponse(allocator, request, cache);
-        defer allocator.free(response_str);
-
-        // Send the Response back to the client.
-        try client_connection.stream.writeAll(response_str);
-        try stdout.print("Done sending response: {s} to client {} at timestamp {d}\n", .{ response_str, client_connection.address.in, std.time.milliTimestamp() });
+        try handleRequestAndRespond(allocator, raw_message.items, cache, client_connection.stream);
 
         // Clear the message since the client might send more, but don't actually deallocate so we can reuse this for the next message.
         raw_message.clearRetainingCapacity();

@@ -9,7 +9,7 @@ This is a WIP Zig solution to the ["Build Your Own Redis" Challenge](https://cod
 # TODOs
 
 ## Important
-- [ ] redo parser in a more general way, it's extremely hacky right now
+- [x] redo parser in a more general way, it's extremely hacky right now
 - [x] figure out allocation for parser
 
 
@@ -27,4 +27,17 @@ This is a WIP Zig solution to the ["Build Your Own Redis" Challenge](https://cod
 
 ## Refactor
 
-- TODO start refactoring parser
+Refactored parser to be cleaner:
+- break out reading the incoming text into a string,
+- converting that string into a Message,
+- interpreting the Message as a Request/Command,
+- updating the state based on the Request,
+- generating a response Message based on the Request,
+- converting the Message back to a string,
+- and finally sending the string back to the client stream.
+- All of the above are in testable functions (most of them have tests at this point).
+
+TODO fix timing issue with expiry. I think it might have to do with assumptions that the redis-tester makes about how long servers take to parse and record the reqeusts. Specifically, the redis-tester assumes that the timestamp of a SET request with an expiry is the instant they receive an +OK reply.
+
+## Replication
+TODO start working on replication challenge
