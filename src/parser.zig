@@ -434,7 +434,7 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
 
                         // If PX and timestamp are provided, also set the expiry field.
                         const expiry = if (messages.len == 5 and std.ascii.eqlIgnoreCase(try messages[3].get_contents(), "px"))
-                            try std.fmt.parseInt(i64, try messages[4].get_contents(), 10)
+                            try std.fmt.parseInt(i64, try messages[4].get_contents(), 10) + std.time.milliTimestamp()
                         else
                             null;
 
@@ -497,11 +497,14 @@ test "parseRequest SetCommand" {
         try testing.expect(request.command.set.expiry == null);
     }
     {
+        // We can't predict exactly what expiry timestamp the cache will record (because time will elapse from this moment until we actually put the entry
+        // in the hashmap and), but it must at least be 1234 milliseconds after this moment.
+        const time_before_request = std.time.milliTimestamp();
         var request = try parseRequest(testing.allocator, "*5\r\n$3\r\nsEt\r\n$4\r\nfour\r\n$4\r\nFOUR\r\n$2\r\nPx\r\n$4\r\n1234\r\n");
         defer request.deinit();
         try testing.expectEqualSlices(u8, "four", request.command.set.key);
         try testing.expectEqualSlices(u8, "FOUR", request.command.set.value);
-        try testing.expectEqual(1234, request.command.set.expiry.?);
+        try testing.expect(request.command.set.expiry.? >= time_before_request + 1234);
     }
 }
 // TODO test errors for parseRequest
