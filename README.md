@@ -37,7 +37,7 @@ Refactored parser to be cleaner:
 - and finally sending the string back to the client stream.
 - All of the above are in testable functions (most of them have tests at this point).
 
-TODO fix timing issue with expiry. I think it might have to do with assumptions that the redis-tester makes about how long servers take to parse and record the reqeusts. Specifically, the redis-tester assumes that the timestamp of a SET request with an expiry is the instant they receive an +OK reply.
+[DONE] fix timing issue with expiry. I think it might have to do with assumptions that the redis-tester makes about how long servers take to parse and record the reqeusts. Specifically, the redis-tester assumes that the timestamp of a SET request with an expiry is the instant they receive an +OK reply.
 
 ## Replication
 TODO start working on replication challenge
