@@ -16,6 +16,7 @@ This is a WIP Zig solution to the ["Build Your Own Redis" Challenge](https://cod
 ## Nice-to-haves
 - [ ] set up the integration tests to use the Zig build system instead of crappy Make.
 - [x] proper unit test discovery in build.zig
+- [ ] a few gaps in unit tests, but they're covered by a basic integration test + the redis-tester so meh
 
 # Work Log
 
@@ -40,4 +41,6 @@ Refactored parser to be cleaner:
 [DONE] fix timing issue with expiry. I think it might have to do with assumptions that the redis-tester makes about how long servers take to parse and record the reqeusts. Specifically, the redis-tester assumes that the timestamp of a SET request with an expiry is the instant they receive an +OK reply.
 
 ## Replication
-TODO start working on replication challenge
+- Started working on replication challenge
+- I'm doing the CLI parsing completely manually. As long as I don't get too many complex args, this should be ok-ish.
+- Realized that one of my optimizations to avoid allocating when creating a Message out of a Request is giving me trouble. So my workaround is to give each message an optional allocator field, that can be used in cases where allocation is needed and is ignored when not. This makes the deinit() know when to free (we have an allocator) and when not to. This might be clever, but it's introducing a bunch of complexity and the codebase will be hard to understand and reason about.

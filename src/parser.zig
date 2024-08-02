@@ -2,6 +2,8 @@ const std = @import("std");
 const net = std.net;
 const stdout = std.io.getStdOut().writer();
 const Cache = @import("rw_lock_hashmap.zig").RwLockHashMap;
+const server_config = @import("config.zig");
+const Config = server_config.Config;
 const testing = std.testing;
 
 pub const CLIENT_READER_CHUNK_SIZE = 1 << 10;
@@ -27,8 +29,10 @@ const Error = error{
 // NOTE: we have to make these into wrapper classes because otherwise these String types would be aliases to []const u8, and then we can't distinguish between the two in the tagged union.
 const SimpleString = struct {
     value: []const u8,
+    allocator: ?std.mem.Allocator = null,
 
     const Self = @This();
+
     fn fromStr(raw_message: []const u8) Error!Self {
         const rest_of_text = raw_message[1..];
         const index = std.mem.indexOf(u8, rest_of_text, CRLF_DELIMITER);
@@ -37,6 +41,10 @@ const SimpleString = struct {
         }
         return Error.MissingDelimiter;
     }
+    fn fromStrAlloc(allocator: std.mem.Allocator, raw_message: []const u8) Error!Self {
+        const str = try fromStr(raw_message);
+        return SimpleString{ .allocator = allocator, .value = try allocator.dupe(u8, str.value) };
+    }
     fn toStr(self: *const Self, allocator: std.mem.Allocator) Error![]const u8 {
         return std.fmt.allocPrint(allocator, "+{s}{s}", .{ self.value, CRLF_DELIMITER });
     }
@@ -44,6 +52,7 @@ const SimpleString = struct {
 
 const BulkString = struct {
     value: []const u8,
+    allocator: ?std.mem.Allocator = null,
 
     const Self = @This();
     fn fromStr(raw_message: []const u8) Error!Self {
@@ -65,6 +74,10 @@ const BulkString = struct {
             return .{ .value = rest_of_text[text_idx_start..text_idx_end] };
         }
         return Error.MissingDelimiter;
+    }
+    fn fromStrAlloc(allocator: std.mem.Allocator, raw_message: []const u8) Error!Self {
+        const str = try fromStr(raw_message);
+        return SimpleString{ .allocator = allocator, .value = try allocator.dupe(u8, str.value) };
     }
     fn toStr(self: *const Self, allocator: std.mem.Allocator) Error![]const u8 {
         // Special case, handle null bulk string.
@@ -184,11 +197,16 @@ const Message = union(MessageType) {
     // Frees only the Message slice when this Message is an Array. Does not free the contents (strings), since those are not owned by the Messages.
     pub fn deinit(self: *Self) void {
         switch (self.*) {
-            .array => {
-                // NOTE: we don't need to recursively free because our elements are guaranteed never to be Arrays themselves.
-                self.array.allocator.free(self.array.elements);
+            .simple_string => |s| {
+                if (s.allocator) |alloc| alloc.free(s.value);
             },
-            else => return,
+            .bulk_string => |b| {
+                if (b.allocator) |alloc| alloc.free(b.value);
+            },
+            .array => |arr| {
+                // NOTE: we don't need to recursively free because our elements are guaranteed never to be Arrays themselves.
+                arr.allocator.free(arr.elements);
+            },
         }
     }
     // Caller is responsible for calling deinit() on returned Message, which is only strictly necessary when the returned Message is an Array.
@@ -347,23 +365,27 @@ test "Message roundtrip Array" {
     try testing.expectEqualSlices(u8, msg.array.elements[0].bulk_string.value, msg_again.array.elements[0].bulk_string.value);
     try testing.expectEqualSlices(u8, msg.array.elements[1].simple_string.value, msg_again.array.elements[1].simple_string.value);
 }
+// TODO add tests for case when SimpleString and BulkString have allocators and use them to free.
 
 // Messages from the client are parsed as one of these Requests, which are then processed to produce a Response.
 const PingCommand = struct { contents: ?[]const u8 };
 const EchoCommand = struct { contents: []const u8 };
 const SetCommand = struct { key: []const u8, value: []const u8, expiry: Cache.ExpiryTimestampMs };
 const GetCommand = struct { key: []const u8 };
+const InfoCommand = struct { section_keys: [][]const u8 };
 const CommandType = enum {
     ping,
     echo,
     set,
     get,
+    info,
 };
 const Command = union(CommandType) {
     ping: PingCommand,
     echo: EchoCommand,
     set: SetCommand,
     get: GetCommand,
+    info: InfoCommand,
 };
 
 const Request = struct {
@@ -385,6 +407,12 @@ const Request = struct {
             },
             .get => |g| {
                 self.allocator.free(g.key);
+            },
+            .info => |i| {
+                for (i.section_keys) |key| {
+                    self.allocator.free(key);
+                }
+                self.allocator.free(i.section_keys);
             },
         }
     }
@@ -444,6 +472,18 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
                         return Error.InvalidRequestNumberOfArgs;
                     },
                 }
+            }
+            if (std.ascii.eqlIgnoreCase(first_word, "info")) {
+                // TODO we should dedupe any given section keys.
+                // This seems like a bunch of unnecessary allocating, but it's ok since we're using an arena allocator backed by a page allocator.
+                const section_messages = messages[1..];
+                var temp_list = std.ArrayList([]const u8).init(allocator);
+                errdefer temp_list.deinit();
+                for (section_messages) |msg| {
+                    try temp_list.append(try msg.get_contents());
+                }
+                // We transfer ownership of the section_keys within the Request to the caller.
+                return Request{ .command = Command{ .info = .{ .section_keys = try temp_list.toOwnedSlice() } }, .allocator = allocator };
             }
         },
         else => {
@@ -555,8 +595,7 @@ test "handleRequest SetCommand" {
     }
 }
 
-// NOTE: because we don't write out Array Messages, we don't need to allocate the Message.
-fn getResponseMessage(request: Request, cache: *Cache) !Message {
+fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Cache, config: *const Config) !Message {
     switch (request.command) {
         .ping => |p| {
             if (p.contents) |text| {
@@ -577,13 +616,44 @@ fn getResponseMessage(request: Request, cache: *Cache) !Message {
         .set => {
             return Message{ .simple_string = .{ .value = "OK" } };
         },
+        .info => |i| {
+            var concatenated: []const u8 = try allocator.alloc(u8, 0);
+            errdefer allocator.free(concatenated);
+
+            // For every key we are given in the INFO command,
+            for (i.section_keys) |key| {
+                const tmp = concatenated;
+                defer allocator.free(tmp);
+
+                // TODO for now we just ignore unknown section keys.
+                // TODO hide away this monstrosity in some well-named function.
+                // Find the field in Config that matches the key (e.g. "replication").
+                const config_fields = @typeInfo(Config).Struct.fields;
+                inline for (config_fields) |field| {
+                    if (std.ascii.eqlIgnoreCase(field.name, key)) {
+                        // Now, take that config field (e.g. ReplicationConfig) and concatenate all its fields as key:value strings.
+                        const config_section = @field(config, field.name);
+                        inline for (@typeInfo(@TypeOf(config_section)).Struct.fields) |section_field| {
+                            const line = try std.fmt.allocPrint(allocator, "{s}:{s}\n", .{ section_field.name, @field(config_section, section_field.name) });
+                            defer allocator.free(line);
+
+                            concatenated = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ concatenated, line });
+                            allocator.free(tmp);
+                        }
+                    }
+                }
+            }
+            return Message{ .bulk_string = .{ .value = concatenated } };
+        },
     }
     return error.UnimplementedError;
 }
 
 // Caller owns returned string.
-pub fn getResponse(allocator: std.mem.Allocator, request: Request, cache: *Cache) ![]const u8 {
-    const response_message = try getResponseMessage(request, cache);
+pub fn getResponse(allocator: std.mem.Allocator, request: Request, cache: *Cache, config: *const Config) ![]const u8 {
+    var response_message = try getResponseMessage(allocator, request, cache, config);
+    defer response_message.deinit();
+
     return response_message.toStr(allocator);
 }
 

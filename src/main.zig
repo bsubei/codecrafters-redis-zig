@@ -3,9 +3,12 @@ const net = std.net;
 const stdout = std.io.getStdOut().writer();
 const Cache = @import("rw_lock_hashmap.zig").RwLockHashMap;
 const parser = @import("parser.zig");
+const cli = @import("cli.zig");
+const server_config = @import("config.zig");
+const Config = server_config.Config;
 const testing = std.testing;
 
-fn handleRequestAndRespond(allocator: std.mem.Allocator, raw_message: []const u8, cache: *Cache, client_stream: anytype) !void {
+fn handleRequestAndRespond(allocator: std.mem.Allocator, raw_message: []const u8, cache: *Cache, config: *const Config, client_stream: anytype) !void {
     // Parse the raw_message into a Request (a command from the client).
     var request = try parser.parseRequest(allocator, raw_message);
     defer request.deinit();
@@ -14,7 +17,7 @@ fn handleRequestAndRespond(allocator: std.mem.Allocator, raw_message: []const u8
     try parser.handleRequest(request, cache);
 
     // Generate a Response to the Request as a string.
-    const response_str = try parser.getResponse(allocator, request, cache);
+    const response_str = try parser.getResponse(allocator, request, cache, config);
     defer allocator.free(response_str);
 
     // Send the Response back to the client.
@@ -24,33 +27,35 @@ fn handleRequestAndRespond(allocator: std.mem.Allocator, raw_message: []const u8
 test "handleRequestAndRespond" {
     var cache = Cache.init(testing.allocator);
     defer cache.deinit();
+    const args = cli.Args{ .port = 123 };
+    const config = try server_config.createConfig(testing.allocator, args);
     {
         var buffer: [64]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buffer);
-        try handleRequestAndRespond(testing.allocator, "*2\r\n$4\r\nECHO\r\n$13\r\nHello, world!\r\n", &cache, fbs.writer());
+        try handleRequestAndRespond(testing.allocator, "*2\r\n$4\r\nECHO\r\n$13\r\nHello, world!\r\n", &cache, &config, fbs.writer());
         try testing.expectEqualSlices(u8, "$13\r\nHello, world!\r\n", fbs.getWritten());
     }
     {
         var buffer: [64]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buffer);
-        try handleRequestAndRespond(testing.allocator, "*2\r\n$3\r\ngEt\r\n$13\r\nHello, world!\r\n", &cache, fbs.writer());
+        try handleRequestAndRespond(testing.allocator, "*2\r\n$3\r\ngEt\r\n$13\r\nHello, world!\r\n", &cache, &config, fbs.writer());
         try testing.expectEqualSlices(u8, "$-1\r\n", fbs.getWritten());
     }
     {
         var buffer: [64]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buffer);
-        try handleRequestAndRespond(testing.allocator, "*3\r\n$3\r\nSEt\r\n$13\r\nHello, world!\r\n$4\r\nbye!\r\n", &cache, fbs.writer());
+        try handleRequestAndRespond(testing.allocator, "*3\r\n$3\r\nSEt\r\n$13\r\nHello, world!\r\n$4\r\nbye!\r\n", &cache, &config, fbs.writer());
         try testing.expectEqualSlices(u8, "+OK\r\n", fbs.getWritten());
     }
     {
         var buffer: [64]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buffer);
-        try handleRequestAndRespond(testing.allocator, "*2\r\n$3\r\ngEt\r\n$13\r\nHello, world!\r\n", &cache, fbs.writer());
+        try handleRequestAndRespond(testing.allocator, "*2\r\n$3\r\ngEt\r\n$13\r\nHello, world!\r\n", &cache, &config, fbs.writer());
         try testing.expectEqualSlices(u8, "$4\r\nbye!\r\n", fbs.getWritten());
     }
 }
 
-fn handleClient(client_connection: net.Server.Connection, cache: *Cache) !void {
+fn handleClient(client_connection: net.Server.Connection, cache: *Cache, config: *const Config) !void {
     defer client_connection.stream.close();
 
     // We don't expect each client to use up too much memory, so we use an arena allocator for speed and blow away all the memory at once when we're done.
@@ -78,36 +83,11 @@ fn handleClient(client_connection: net.Server.Connection, cache: *Cache) !void {
             continue;
         }
 
-        try handleRequestAndRespond(allocator, raw_message.items, cache, client_connection.stream);
+        try handleRequestAndRespond(allocator, raw_message.items, cache, config, client_connection.stream);
 
         // Clear the message since the client might send more, but don't actually deallocate so we can reuse this for the next message.
         raw_message.clearRetainingCapacity();
     }
-}
-
-const DEFAULT_PORT = 6379;
-const Error = error{
-    BadCLIArgument,
-};
-const Args = struct {
-    port: u16,
-};
-fn parseArgs(allocator: std.mem.Allocator) !Args {
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
-    var port: ?u16 = null;
-
-    for (args, 0..) |arg, idx| {
-        if (std.mem.eql(u8, arg, "--port")) {
-            if (idx + 1 >= args.len) {
-                return Error.BadCLIArgument;
-            }
-            port = try std.fmt.parseInt(u16, args[idx + 1], 10);
-        }
-    }
-
-    return Args{ .port = if (port) |p| p else DEFAULT_PORT };
 }
 
 pub fn main() !void {
@@ -115,7 +95,8 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try parseArgs(allocator);
+    const args = try cli.parseArgs(allocator);
+    const config = try server_config.createConfig(allocator, args);
 
     var cache = Cache.init(allocator);
     defer cache.deinit();
@@ -136,7 +117,7 @@ pub fn main() !void {
         try stdout.print("accepted new connection from client {}\n", .{connection.address.in.sa.port});
         // TODO join on these threads for correctness.
         // TODO handle errors coming back from these threads.
-        const t = try std.Thread.spawn(.{}, handleClient, .{ connection, &cache });
+        const t = try std.Thread.spawn(.{}, handleClient, .{ connection, &cache, &config });
         t.detach();
     }
 }
