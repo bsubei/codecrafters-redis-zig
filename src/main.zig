@@ -27,7 +27,7 @@ fn handleRequestAndRespond(allocator: std.mem.Allocator, raw_message: []const u8
 test "handleRequestAndRespond" {
     var cache = Cache.init(testing.allocator);
     defer cache.deinit();
-    const args = cli.Args{ .port = 123 };
+    const args = cli.Args{ .port = 123, .replicaof = null, .allocator = null };
     const config = try server_config.createConfig(testing.allocator, args);
     {
         var buffer: [64]u8 = undefined;
@@ -54,6 +54,7 @@ test "handleRequestAndRespond" {
         try testing.expectEqualSlices(u8, "$4\r\nbye!\r\n", fbs.getWritten());
     }
 }
+// TODO add a test for INFO
 
 fn handleClient(client_connection: net.Server.Connection, cache: *Cache, config: *const Config) !void {
     defer client_connection.stream.close();
@@ -95,7 +96,9 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try cli.parseArgs(allocator);
+    var args = try cli.parseArgs(allocator);
+    defer args.deinit();
+
     const config = try server_config.createConfig(allocator, args);
 
     var cache = Cache.init(allocator);

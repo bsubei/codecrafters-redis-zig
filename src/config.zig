@@ -10,8 +10,15 @@ pub const Config = struct {
 };
 
 pub fn createConfig(allocator: std.mem.Allocator, args: Args) !Config {
-    _ = args;
     _ = allocator;
-    const replication = .{ .role = "master" };
+    var replication: ReplicationConfig = undefined;
+    if (args.replicaof) |replicaof| {
+        _ = replicaof;
+        replication = .{ .role = "slave" };
+    } else {
+        replication = .{ .role = "master" };
+    }
     return Config{ .replication = replication };
 }
+
+// TODO test createConfig

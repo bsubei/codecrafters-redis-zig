@@ -548,6 +548,7 @@ test "parseRequest SetCommand" {
     }
 }
 // TODO test errors for parseRequest
+// TODO test parseRequest for InfoCommand
 
 pub fn handleRequest(request: Request, cache: *Cache) !void {
     // We only need to update state for SET commands. Everything else is ignored here.

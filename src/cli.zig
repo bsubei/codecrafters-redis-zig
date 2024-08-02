@@ -4,14 +4,32 @@ const DEFAULT_PORT = 6379;
 const Error = error{
     BadCLIArgument,
 };
+const ReplicaOf = struct {
+    master_host: []const u8,
+    master_port: u16,
+};
+// Args will have an allocator if any of its fields (e.g. replicaof) needed allocations. deinit() will take care of freeing that data in case the allocator was set.
 pub const Args = struct {
     port: u16,
+    replicaof: ?ReplicaOf,
+    allocator: ?std.mem.Allocator,
+
+    const Self = @This();
+    pub fn deinit(self: *Self) void {
+        if (self.allocator) |alloc| {
+            if (self.replicaof) |replicaof| {
+                alloc.free(replicaof.master_host);
+            }
+        }
+    }
 };
+// TODO refactor this to make it testable and write tests.
 pub fn parseArgs(allocator: std.mem.Allocator) !Args {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
     var port: ?u16 = null;
+    var replicaof: ?ReplicaOf = null;
 
     for (args, 0..) |arg, idx| {
         if (std.mem.eql(u8, arg, "--port")) {
@@ -20,7 +38,23 @@ pub fn parseArgs(allocator: std.mem.Allocator) !Args {
             }
             port = try std.fmt.parseInt(u16, args[idx + 1], 10);
         }
+        if (std.mem.eql(u8, arg, "--replicaof")) {
+            if (idx + 1 >= args.len) {
+                return Error.BadCLIArgument;
+            }
+            var iter = std.mem.splitScalar(u8, args[idx + 1], ' ');
+            const first = iter.next();
+            const second = iter.next();
+            if (first != null and second != null) {
+                const master_host = try allocator.dupe(u8, first.?);
+                errdefer allocator.free(master_host);
+                const master_port = try std.fmt.parseInt(u16, second.?, 10);
+                replicaof = ReplicaOf{ .master_host = master_host, .master_port = master_port };
+            } else {
+                return Error.BadCLIArgument;
+            }
+        }
     }
 
-    return Args{ .port = if (port) |p| p else DEFAULT_PORT };
+    return Args{ .port = if (port) |p| p else DEFAULT_PORT, .replicaof = replicaof, .allocator = if (replicaof != null) allocator else null };
 }
