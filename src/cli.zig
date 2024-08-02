@@ -8,18 +8,15 @@ const ReplicaOf = struct {
     master_host: []const u8,
     master_port: u16,
 };
-// Args will have an allocator if any of its fields (e.g. replicaof) needed allocations. deinit() will take care of freeing that data in case the allocator was set.
 pub const Args = struct {
     port: u16,
     replicaof: ?ReplicaOf,
-    allocator: ?std.mem.Allocator,
+    allocator: std.mem.Allocator,
 
     const Self = @This();
     pub fn deinit(self: *Self) void {
-        if (self.allocator) |alloc| {
-            if (self.replicaof) |replicaof| {
-                alloc.free(replicaof.master_host);
-            }
+        if (self.replicaof) |replicaof| {
+            self.allocator.free(replicaof.master_host);
         }
     }
 };
@@ -56,5 +53,5 @@ pub fn parseArgs(allocator: std.mem.Allocator) !Args {
         }
     }
 
-    return Args{ .port = if (port) |p| p else DEFAULT_PORT, .replicaof = replicaof, .allocator = if (replicaof != null) allocator else null };
+    return Args{ .port = if (port) |p| p else DEFAULT_PORT, .replicaof = replicaof, .allocator = allocator };
 }

@@ -27,8 +27,8 @@ fn handleRequestAndRespond(allocator: std.mem.Allocator, raw_message: []const u8
 test "handleRequestAndRespond" {
     var cache = Cache.init(testing.allocator);
     defer cache.deinit();
-    const args = cli.Args{ .port = 123, .replicaof = null, .allocator = null };
-    const config = try server_config.createConfig(testing.allocator, args);
+    const args = cli.Args{ .port = 123, .replicaof = null, .allocator = testing.allocator };
+    var config = try server_config.createConfig(args);
     {
         var buffer: [64]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buffer);
@@ -99,7 +99,7 @@ pub fn main() !void {
     var args = try cli.parseArgs(allocator);
     defer args.deinit();
 
-    const config = try server_config.createConfig(allocator, args);
+    var config = try server_config.createConfig(args);
 
     var cache = Cache.init(allocator);
     defer cache.deinit();

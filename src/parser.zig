@@ -631,11 +631,18 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Ca
                 // Find the field in Config that matches the key (e.g. "replication").
                 const config_fields = @typeInfo(Config).Struct.fields;
                 inline for (config_fields) |field| {
+                    // Skip any optional fields that are not activated.
+                    const field_value = @field(config, field.name);
+                    if (@typeInfo(@TypeOf(field_value)) == .Optional and @field(config, field.name) == null) {
+                        continue;
+                    }
                     if (std.ascii.eqlIgnoreCase(field.name, key)) {
                         // Now, take that config field (e.g. ReplicationConfig) and concatenate all its fields as key:value strings.
                         const config_section = @field(config, field.name);
                         inline for (@typeInfo(@TypeOf(config_section)).Struct.fields) |section_field| {
-                            const line = try std.fmt.allocPrint(allocator, "{s}:{s}\n", .{ section_field.name, @field(config_section, section_field.name) });
+                            // The formatter string depends on the section's type, i.e. if it's a slice/array of bytes, it should be formatted as a string. Otherwise, as a decimal number.
+                            const formatter_string = comptime getFormatterString(section_field.type);
+                            const line = try std.fmt.allocPrint(allocator, formatter_string, .{ section_field.name, @field(config_section, section_field.name) });
                             defer allocator.free(line);
 
                             concatenated = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ concatenated, line });
@@ -648,6 +655,33 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Ca
         },
     }
     return error.UnimplementedError;
+}
+
+fn isStringType(comptime field: type) bool {
+    switch (@typeInfo(field)) {
+        .Array => |info| {
+            if (info.child == u8) {
+                return true;
+            }
+        },
+        .Pointer => |info| {
+            if (info.size == .Slice and info.child == u8) {
+                return true;
+            }
+        },
+        else => return false,
+    }
+}
+
+fn getFormatterString(comptime field: type) []const u8 {
+    const is_optional = @typeInfo(field) == .Optional;
+    const underlying_type = if (is_optional) @typeInfo(field).Optional.child else field;
+
+    if (isStringType(underlying_type)) {
+        return if (is_optional) "{s}:{?s}\n" else "{s}:{s}\n";
+    } else {
+        return if (is_optional) "{s}:{?d}\n" else "{s}:{d}\n";
+    }
 }
 
 // Caller owns returned string.
