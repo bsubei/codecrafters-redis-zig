@@ -620,33 +620,36 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Ca
         .info => |i| {
             var concatenated: []const u8 = try allocator.alloc(u8, 0);
             errdefer allocator.free(concatenated);
+            // A Config consists of multiple sections, e.g. ReplicationConfig is one section.
+            // Each section consists of multiple fields.
+            // The INFO command will list section keys, and we should print all sections that match those keys.
+            // Printing a section means we go over every field in that section and print the field name and field value (name:value).
 
-            // For every key we are given in the INFO command,
-            for (i.section_keys) |key| {
+            // For every section key we are given in the INFO command,
+            for (i.section_keys) |section_key| {
                 const tmp = concatenated;
                 defer allocator.free(tmp);
 
                 // TODO for now we just ignore unknown section keys.
                 // TODO hide away this monstrosity in some well-named function.
-                // Find the field in Config that matches the key (e.g. "replication").
-                const config_fields = @typeInfo(Config).Struct.fields;
-                inline for (config_fields) |field| {
-                    // Skip any optional fields that are not activated.
-                    const field_value = @field(config, field.name);
-                    if (@typeInfo(@TypeOf(field_value)) == .Optional and @field(config, field.name) == null) {
-                        continue;
-                    }
-                    if (std.ascii.eqlIgnoreCase(field.name, key)) {
-                        // Now, take that config field (e.g. ReplicationConfig) and concatenate all its fields as key:value strings.
-                        const config_section = @field(config, field.name);
-                        inline for (@typeInfo(@TypeOf(config_section)).Struct.fields) |section_field| {
-                            // The formatter string depends on the section's type, i.e. if it's a slice/array of bytes, it should be formatted as a string. Otherwise, as a decimal number.
-                            const formatter_string = comptime getFormatterString(section_field.type);
-                            const line = try std.fmt.allocPrint(allocator, formatter_string, .{ section_field.name, @field(config_section, section_field.name) });
-                            defer allocator.free(line);
 
-                            concatenated = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ concatenated, line });
-                            allocator.free(tmp);
+                // Find the section in Config that matches the section_key (e.g. "replication").
+                inline for (@typeInfo(Config).Struct.fields) |section| {
+                    if (std.ascii.eqlIgnoreCase(section.name, section_key)) {
+                        // Now, take that config section (e.g. ReplicationConfig) and concatenate all its fields as name:value strings.
+                        const config_section = @field(config, section.name);
+                        inline for (@typeInfo(@TypeOf(config_section)).Struct.fields) |section_field| {
+                            // Skip any optional fields that are not activated.
+                            const field_value = @field(config_section, section_field.name);
+                            if (@typeInfo(section_field.type) != .Optional or field_value != null) {
+                                // The formatter string depends on the section_field's type, i.e. {s} for strings and {d} for decimals etc.
+                                const formatter_string = comptime getFormatterString(section_field.type);
+                                const line = try std.fmt.allocPrint(allocator, formatter_string, .{ section_field.name, @field(config_section, section_field.name) });
+                                defer allocator.free(line);
+
+                                concatenated = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ concatenated, line });
+                                allocator.free(tmp);
+                            }
                         }
                     }
                 }
@@ -682,6 +685,14 @@ fn getFormatterString(comptime field: type) []const u8 {
     } else {
         return if (is_optional) "{s}:{?d}\n" else "{s}:{d}\n";
     }
+}
+test "getFormatterString" {
+    try testing.expectEqualSlices(u8, "{s}:{s}\n", getFormatterString([]const u8));
+    try testing.expectEqualSlices(u8, "{s}:{?s}\n", getFormatterString(?[]const u8));
+    try testing.expectEqualSlices(u8, "{s}:{s}\n", getFormatterString([100]u8));
+    try testing.expectEqualSlices(u8, "{s}:{?s}\n", getFormatterString(?[100]u8));
+    try testing.expectEqualSlices(u8, "{s}:{d}\n", getFormatterString(u64));
+    try testing.expectEqualSlices(u8, "{s}:{?d}\n", getFormatterString(?u64));
 }
 
 // Caller owns returned string.

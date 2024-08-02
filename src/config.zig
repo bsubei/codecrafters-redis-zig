@@ -2,7 +2,7 @@ const std = @import("std");
 const cli = @import("cli.zig");
 const Args = cli.Args;
 
-const ReplicationConfig = struct {
+pub const ReplicationConfig = struct {
     role: []const u8,
     master_replid: ?[40]u8,
     master_repl_offset: u64,
