@@ -4,25 +4,34 @@ const stdout = std.io.getStdOut().writer();
 const testing = std.testing;
 const Cache = @import("RwLockHashMap.zig");
 const parser = @import("parser.zig");
-const cli = @import("cli.zig");
-const server_config = @import("config.zig");
+const ServerState = @import("ServerState.zig");
 const network = @import("network.zig");
-const ServerConfig = server_config.ServerConfig;
 
 const Error = error{
     badConfiguration,
 };
 
-fn handleRequestAndRespond(allocator: std.mem.Allocator, raw_message: []const u8, cache: *Cache, config: *const ServerConfig, client_stream: anytype) !void {
+pub fn runServer(state: *ServerState) !void {
+    switch (state.info_sections.replication.role) {
+        .master => {
+            try runMasterServer(state);
+        },
+        .slave => {
+            try runSlaveServer(state);
+        },
+    }
+}
+
+fn handleRequestAndRespond(allocator: std.mem.Allocator, raw_message: []const u8, state: *ServerState, client_stream: anytype) !void {
     // Parse the raw_message into a Request (a command from the client).
     var request = try parser.parseRequest(allocator, raw_message);
     defer request.deinit();
 
     // Handle the Request (update state).
-    try parser.handleRequest(request, cache);
+    try parser.handleRequest(request, state);
 
     // Generate a Response to the Request as a string.
-    const response_str = try parser.getResponse(allocator, request, cache, config);
+    const response_str = try parser.getResponse(allocator, request, state);
     defer allocator.free(response_str);
 
     // Send the Response back to the client.
@@ -30,38 +39,37 @@ fn handleRequestAndRespond(allocator: std.mem.Allocator, raw_message: []const u8
 }
 
 test "handleRequestAndRespond" {
-    var cache = Cache.init(testing.allocator);
-    defer cache.deinit();
-    const master_args = cli.Args{ .port = 123, .replicaof = null, .allocator = testing.allocator };
-    const master_config = try server_config.createConfig(master_args);
+    var state = try ServerState.initFromCliArgs(testing.allocator, &[_][]const u8{ "--port", "123" });
+    defer state.deinit();
+
     {
         var buffer: [64]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buffer);
-        try handleRequestAndRespond(testing.allocator, "*2\r\n$4\r\nECHO\r\n$13\r\nHello, world!\r\n", &cache, &master_config, fbs.writer());
+        try handleRequestAndRespond(testing.allocator, "*2\r\n$4\r\nECHO\r\n$13\r\nHello, world!\r\n", &state, fbs.writer());
         try testing.expectEqualSlices(u8, "$13\r\nHello, world!\r\n", fbs.getWritten());
     }
     {
         var buffer: [64]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buffer);
-        try handleRequestAndRespond(testing.allocator, "*2\r\n$3\r\ngEt\r\n$13\r\nHello, world!\r\n", &cache, &master_config, fbs.writer());
+        try handleRequestAndRespond(testing.allocator, "*2\r\n$3\r\ngEt\r\n$13\r\nHello, world!\r\n", &state, fbs.writer());
         try testing.expectEqualSlices(u8, "$-1\r\n", fbs.getWritten());
     }
     {
         var buffer: [64]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buffer);
-        try handleRequestAndRespond(testing.allocator, "*3\r\n$3\r\nSEt\r\n$13\r\nHello, world!\r\n$4\r\nbye!\r\n", &cache, &master_config, fbs.writer());
+        try handleRequestAndRespond(testing.allocator, "*3\r\n$3\r\nSEt\r\n$13\r\nHello, world!\r\n$4\r\nbye!\r\n", &state, fbs.writer());
         try testing.expectEqualSlices(u8, "+OK\r\n", fbs.getWritten());
     }
     {
         var buffer: [64]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buffer);
-        try handleRequestAndRespond(testing.allocator, "*2\r\n$3\r\ngEt\r\n$13\r\nHello, world!\r\n", &cache, &master_config, fbs.writer());
+        try handleRequestAndRespond(testing.allocator, "*2\r\n$3\r\ngEt\r\n$13\r\nHello, world!\r\n", &state, fbs.writer());
         try testing.expectEqualSlices(u8, "$4\r\nbye!\r\n", fbs.getWritten());
     }
     {
         var buffer: [128]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buffer);
-        try handleRequestAndRespond(testing.allocator, "*2\r\n$4\r\nINfo\r\n$11\r\nrePLicAtion\r\n", &cache, &master_config, fbs.writer());
+        try handleRequestAndRespond(testing.allocator, "*2\r\n$4\r\nINfo\r\n$11\r\nrePLicAtion\r\n", &state, fbs.writer());
         var iter = std.mem.splitScalar(u8, fbs.getWritten(), '\n');
         {
             const line = iter.next();
@@ -101,7 +109,7 @@ test "handleRequestAndRespond" {
     }
 }
 
-fn handleClient(client_stream: net.Stream, config: *const ServerConfig, cache: *Cache) !void {
+fn handleClient(client_stream: net.Stream, state: *ServerState) !void {
     defer client_stream.close();
 
     // We don't expect each client to use up too much memory, so we use an arena allocator for speed and blow away all the memory at once when we're done.
@@ -115,26 +123,26 @@ fn handleClient(client_stream: net.Stream, config: *const ServerConfig, cache: *
         const num_read_bytes = try network.readFromStream(client_stream, &raw_message);
         if (num_read_bytes == 0) return;
 
-        try handleRequestAndRespond(allocator, raw_message.items, cache, config, client_stream);
+        try handleRequestAndRespond(allocator, raw_message.items, state, client_stream);
 
         // Clear the message since the client might send more, but don't actually deallocate so we can reuse this for the next message.
         raw_message.clearRetainingCapacity();
     }
 }
 
-fn loadRdbFile(rdb: parser.RdbFile, cache: *Cache) !void {
+fn loadRdbFile(rdb: parser.RdbFile, state: *ServerState) !void {
     // TODO take the parsed RDB that master sent and use it to update our state.
     _ = rdb;
-    _ = cache;
+    _ = state;
 }
-fn syncWithMaster(allocator: std.mem.Allocator, master_stream: net.Stream, cache: *Cache) !void {
+fn syncWithMaster(allocator: std.mem.Allocator, master_stream: net.Stream, state: *ServerState) !void {
     // Send full sync handshake to master
     const rdb = try parser.sendSyncHandshakeToMaster(allocator, master_stream);
 
     // Take the parsed RDB that master sent and use it to update our state.
-    try loadRdbFile(rdb, cache);
+    try loadRdbFile(rdb, state);
 }
-fn listenForClientsAndHandleRequests(address: net.Address, config: *const ServerConfig, cache: *Cache) !void {
+fn listenForClientsAndHandleRequests(address: net.Address, state: *ServerState) !void {
     // Keep listening to new client connections, and once one comes in, set it up to be handled be a new thread and go back to listening.
     var listener = try address.listen(.{
         .reuse_address = true,
@@ -148,16 +156,17 @@ fn listenForClientsAndHandleRequests(address: net.Address, config: *const Server
         try stdout.print("accepted new connection from client {}\n", .{connection.address.in.sa.port});
         // TODO join on these threads for correctness.
         // TODO handle errors coming back from these threads.
-        const t = try std.Thread.spawn(.{}, handleClient, .{ connection.stream, config, cache });
+        const t = try std.Thread.spawn(.{}, handleClient, .{ connection.stream, state });
         t.detach();
     }
 }
-pub fn runMasterServer(args: *const cli.Args, config: *const ServerConfig, cache: *Cache) !void {
-    const our_address = try net.Address.resolveIp("127.0.0.1", args.port);
-    try listenForClientsAndHandleRequests(our_address, config, cache);
+pub fn runMasterServer(state: *ServerState) !void {
+    const our_address = try net.Address.resolveIp("127.0.0.1", state.port);
+    try listenForClientsAndHandleRequests(our_address, state);
 }
-pub fn runSlaveServer(args: *const cli.Args, config: *const ServerConfig, cache: *Cache) !void {
-    const our_address = try net.Address.resolveIp("127.0.0.1", args.port);
+// TODO combine configs, cli args, and cache into one struct. Hide everything in there behind a read-write lock.
+pub fn runSlaveServer(state: *ServerState) !void {
+    const our_address = try net.Address.resolveIp("127.0.0.1", state.port);
 
     // Set up an arena allocator backed by a page allocator. We only need it for syncWithMaster.
     {
@@ -165,13 +174,12 @@ pub fn runSlaveServer(args: *const cli.Args, config: *const ServerConfig, cache:
         defer arena.deinit();
         const allocator = arena.allocator();
 
-        // Connect to master.
-        if (args.replicaof == null) return Error.badConfiguration;
-        var master_stream = try std.net.tcpConnectToHost(allocator, args.replicaof.?.master_host, args.replicaof.?.master_port);
+        // Connect to master and ask it to sync. This blocks (does not listen to incoming connections) until finished.
+        if (state.replicaof == null) return Error.badConfiguration;
+        var master_stream = try std.net.tcpConnectToHost(allocator, state.replicaof.?.master_host, state.replicaof.?.master_port);
         defer master_stream.close();
-
-        try syncWithMaster(allocator, master_stream, cache);
+        try syncWithMaster(allocator, master_stream, state);
     }
 
-    try listenForClientsAndHandleRequests(our_address, config, cache);
+    try listenForClientsAndHandleRequests(our_address, state);
 }

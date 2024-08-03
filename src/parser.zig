@@ -6,7 +6,7 @@ const std = @import("std");
 const net = std.net;
 const stdout = std.io.getStdOut().writer();
 const Cache = @import("RwLockHashMap.zig");
-const ServerConfig = @import("config.zig").ServerConfig;
+const ServerState = @import("ServerState.zig");
 const testing = std.testing;
 const string_utils = @import("string_utils.zig");
 const network = @import("network.zig");
@@ -373,20 +373,24 @@ const PingCommand = struct { contents: ?[]const u8 };
 const EchoCommand = struct { contents: []const u8 };
 const SetCommand = struct { key: []const u8, value: []const u8, expiry: Cache.ExpiryTimestampMs };
 const GetCommand = struct { key: []const u8 };
-const InfoCommand = struct { section_keys: [][]const u8 };
+const InfoCommand = struct { arguments: [][]const u8 };
+const ReplconfCommand = struct { arguments: [][]const u8 };
 const CommandType = enum {
     ping,
     echo,
     set,
     get,
     info,
+    replconf,
 };
+// TODO I'm starting to think I need to either rename this or something to account for the fact that these can be sent by a server to respond to requests.
 const Command = union(CommandType) {
     ping: PingCommand,
     echo: EchoCommand,
     set: SetCommand,
     get: GetCommand,
     info: InfoCommand,
+    replconf: ReplconfCommand,
 };
 
 /// Messages from the client are parsed as one of these Requests, which are then processed to produce a Response.
@@ -411,10 +415,16 @@ const Request = struct {
                 self.allocator.free(g.key);
             },
             .info => |i| {
-                for (i.section_keys) |key| {
-                    self.allocator.free(key);
+                for (i.arguments) |arg| {
+                    self.allocator.free(arg);
                 }
-                self.allocator.free(i.section_keys);
+                self.allocator.free(i.arguments);
+            },
+            .replconf => |r| {
+                for (r.arguments) |arg| {
+                    self.allocator.free(arg);
+                }
+                self.allocator.free(r.arguments);
             },
         }
     }
@@ -484,9 +494,10 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
                 for (section_messages) |msg| {
                     try temp_list.append(try allocator.dupe(u8, try msg.get_contents()));
                 }
-                // We transfer ownership of the section_keys within the Request to the caller.
-                return Request{ .command = Command{ .info = .{ .section_keys = try temp_list.toOwnedSlice() } }, .allocator = allocator };
+                // We transfer ownership of the arguments within the Request to the caller.
+                return Request{ .command = Command{ .info = .{ .arguments = try temp_list.toOwnedSlice() } }, .allocator = allocator };
             }
+            // TODO handle replconf as master server
         },
         else => {
             // TODO think about implementing simple_string or bulk_string as a request.
@@ -551,56 +562,60 @@ test "parseRequest SetCommand" {
     }
 }
 // TODO test errors for parseRequest
-// TODO test parseRequest for InfoCommand
+// TODO test parseRequest for InfoCommand and ReplconfCommand
 
 /// Given a client request, update any server state if needed.
-pub fn handleRequest(request: Request, cache: *Cache) !void {
+pub fn handleRequest(request: Request, state: *ServerState) !void {
     // We only need to update state for SET commands. Everything else is ignored here.
     switch (request.command) {
         .set => |s| {
-            try cache.putWithExpiry(s.key, s.value, s.expiry);
+            try state.cache.putWithExpiry(s.key, s.value, s.expiry);
+        },
+        .replconf => {
+            // TODO handle replconf (need to register new replica if I'm a master).
         },
         else => {},
     }
 }
 test "handleRequest no effect" {
-    var cache = Cache.init(testing.allocator);
-    try testing.expectEqual(0, cache.count());
+    var state = try ServerState.initFromCliArgs(testing.allocator, &[_][]const u8{});
+    defer state.deinit();
+    try testing.expectEqual(0, state.cache.count());
     {
         const request = Request{ .allocator = undefined, .command = Command{ .echo = EchoCommand{ .contents = "can you hear me?" } } };
-        try handleRequest(request, &cache);
-        try testing.expectEqual(0, cache.count());
+        try handleRequest(request, &state);
+        try testing.expectEqual(0, state.cache.count());
     }
     {
         const request = Request{ .allocator = undefined, .command = Command{ .get = GetCommand{ .key = "does not exist" } } };
-        try handleRequest(request, &cache);
-        try testing.expectEqual(0, cache.count());
+        try handleRequest(request, &state);
+        try testing.expectEqual(0, state.cache.count());
     }
 }
 test "handleRequest SetCommand" {
-    var cache = Cache.init(testing.allocator);
-    defer cache.deinit();
+    var state = try ServerState.initFromCliArgs(testing.allocator, &[_][]const u8{});
+    defer state.deinit();
 
-    try testing.expectEqual(0, cache.count());
+    try testing.expectEqual(0, state.cache.count());
     {
         const request = Request{ .allocator = undefined, .command = Command{ .set = SetCommand{ .key = "key1", .value = "value1", .expiry = null } } };
-        try handleRequest(request, &cache);
-        try testing.expectEqual(1, cache.count());
-        try testing.expectEqualSlices(u8, "value1", cache.get("key1").?);
+        try handleRequest(request, &state);
+        try testing.expectEqual(1, state.cache.count());
+        try testing.expectEqualSlices(u8, "value1", state.cache.get("key1").?);
     }
     {
         // NOTE: even though it's usually a bad idea to write unit tests that depend on timing, this should be fine since we're putting in
         // a big negative expiry. It's unlikely that the system clock will jump back by more than 100 days in the past in between calling cache.putWithExpiry() and cache.get().
         const request = Request{ .allocator = undefined, .command = Command{ .set = SetCommand{ .key = "key1", .value = "value1000", .expiry = -100 * std.time.ms_per_day } } };
-        try handleRequest(request, &cache);
+        try handleRequest(request, &state);
         // Replacing the same key with a new value should result in the same count.
-        try testing.expectEqual(1, cache.count());
+        try testing.expectEqual(1, state.cache.count());
         // The value should be expired.
-        try testing.expectEqual(null, cache.get("key1"));
+        try testing.expectEqual(null, state.cache.get("key1"));
     }
 }
 
-fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Cache, config: *const ServerConfig) !Message {
+fn getResponseMessage(allocator: std.mem.Allocator, request: Request, state: *ServerState) !Message {
     switch (request.command) {
         .ping => |p| {
             if (p.contents) |text| {
@@ -612,7 +627,7 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Ca
             return .{ .bulk_string = .{ .value = e.contents } };
         },
         .get => |g| {
-            const value = cache.get(g.key);
+            const value = state.cache.get(g.key);
             if (value) |v| {
                 return .{ .bulk_string = .{ .value = v } };
             }
@@ -622,7 +637,7 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Ca
             return .{ .simple_string = .{ .value = "OK" } };
         },
         .info => |i| {
-            // A ServerConfig consists of multiple sections, e.g. ReplicationConfig is one section.
+            // A InfoSections consists of multiple sections, e.g. ReplicationConfig is one section.
             // Each section consists of multiple fields.
             // The INFO command will list section keys, and we should print all sections that match those keys.
             // Printing a section means we go over every field in that section and print the field name and field value (name:value).
@@ -630,13 +645,13 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Ca
             var concatenated: []const u8 = try allocator.alloc(u8, 0);
 
             // For every section key we are given in the INFO command,
-            for (i.section_keys) |section_key| {
+            for (i.arguments) |section_key| {
                 // TODO for now we just ignore unknown section keys.
-                // Find the section in ServerConfig that matches the section_key (e.g. "replication").
-                inline for (@typeInfo(ServerConfig).Struct.fields) |section| {
+                // Find the section in InfoSections that matches the section_key (e.g. "replication").
+                inline for (@typeInfo(ServerState.InfoSections).Struct.fields) |section| {
                     if (std.ascii.eqlIgnoreCase(section.name, section_key)) {
                         // Now, take that config section (e.g. ReplicationConfig) and concatenate all its fields as name:value strings.
-                        const config_section = @field(config, section.name);
+                        const config_section = @field(state.info_sections, section.name);
                         inline for (@typeInfo(@TypeOf(config_section)).Struct.fields) |section_field| {
                             const field_value = @field(config_section, section_field.name);
                             concatenated = try string_utils.appendNameValue(allocator, section_field.type, section_field.name, field_value, concatenated);
@@ -647,13 +662,17 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Ca
             // NOTE: we set the allocator for this Message because we want deinit() to free up the value string.
             return .{ .bulk_string = .{ .value = concatenated, .allocator = allocator } };
         },
+        .replconf => {
+            // TODO respond correctly
+            return .{ .simple_string = .{ .value = "OK" } };
+        },
     }
     return error.UnimplementedError;
 }
 
 /// Given a Request from a client, return a string message containing the response to send to the client. Caller owns returned string.
-pub fn getResponse(allocator: std.mem.Allocator, request: Request, cache: *Cache, config: *const ServerConfig) ![]const u8 {
-    var response_message = try getResponseMessage(allocator, request, cache, config);
+pub fn getResponse(allocator: std.mem.Allocator, request: Request, state: *ServerState) ![]const u8 {
+    var response_message = try getResponseMessage(allocator, request, state);
     defer response_message.deinit();
 
     return response_message.toStr(allocator);
@@ -680,6 +699,8 @@ pub fn sendSyncHandshakeToMaster(allocator: std.mem.Allocator, master_stream: ne
     }
 
     // TODO send a REPLCONF to master twice, expecting OK back
+    // const master_port=
+    // Command{.replconf = .{.arguments = {"listening-port", "6380"}}}
 
     // TODO send a PSYNC to master, expecting FULLRESYNC back
 

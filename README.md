@@ -46,3 +46,4 @@ Refactored parser to be cleaner:
 - Realized that one of my optimizations to avoid allocating when creating a Message out of a Request is giving me trouble. So my workaround is to give each message an optional allocator field, that can be used in cases where allocation is needed and is ignored when not. This makes the deinit() know when to free (we have an allocator) and when not to. This might be clever, but it's introducing a bunch of complexity and the codebase will be hard to understand and reason about.
 - Ok I'm having a ton of fun with printing things out based on their type generically (for the INFO command), but it's probably too much of a distraction.
 - The codebase is starting to feel unwieldy and some refactoring is in order.
+- It turns out I didn't do a good job of setting up the data modeling for the server state.

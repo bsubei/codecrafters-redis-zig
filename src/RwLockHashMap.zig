@@ -36,6 +36,7 @@ pub fn put(self: *Self, key: K, value: V) !void {
     try self.putWithExpiry(key, value, null);
 }
 
+/// The provided expiry timestamp is relative, i.e. 100 means the given key-value will expire 100 milliseconds in the future from now.
 pub fn putWithExpiry(self: *Self, key: K, value: V, expiry: ExpiryTimestampMs) !void {
     self.rwLock.lock();
     defer self.rwLock.unlock();
