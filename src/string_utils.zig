@@ -19,7 +19,7 @@ pub fn appendNameValue(allocator: std.mem.Allocator, comptime field_type: type, 
         const line = try allocPrintNameValue(allocator, field_type, field_name, field_value);
         defer allocator.free(line);
 
-        return try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ input_string, line });
+        return try std.fmt.allocPrint(allocator, "{s}{s}", .{ input_string, line });
     }
     return input_string;
 }

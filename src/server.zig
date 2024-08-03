@@ -61,12 +61,7 @@ test "handleRequestAndRespond" {
         {
             const line = iter.next();
             try testing.expect(line != null);
-            try testing.expectEqualStrings("$91\r", line.?);
-        }
-        {
-            const line = iter.next();
-            try testing.expect(line != null);
-            try testing.expectEqualStrings("", line.?);
+            try testing.expectEqualStrings("$88\r", line.?);
         }
         {
             const line = iter.next();
@@ -76,18 +71,8 @@ test "handleRequestAndRespond" {
         {
             const line = iter.next();
             try testing.expect(line != null);
-            try testing.expectEqualStrings("", line.?);
-        }
-        {
-            const line = iter.next();
-            try testing.expect(line != null);
             try testing.expectStringStartsWith(line.?, "master_replid:");
             try testing.expectEqual("master_replid:".len + 40, line.?.len);
-        }
-        {
-            const line = iter.next();
-            try testing.expect(line != null);
-            try testing.expectEqualStrings("", line.?);
         }
         {
             const line = iter.next();
