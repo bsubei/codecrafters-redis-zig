@@ -44,3 +44,5 @@ Refactored parser to be cleaner:
 - Started working on replication challenge
 - I'm doing the CLI parsing completely manually. As long as I don't get too many complex args, this should be ok-ish.
 - Realized that one of my optimizations to avoid allocating when creating a Message out of a Request is giving me trouble. So my workaround is to give each message an optional allocator field, that can be used in cases where allocation is needed and is ignored when not. This makes the deinit() know when to free (we have an allocator) and when not to. This might be clever, but it's introducing a bunch of complexity and the codebase will be hard to understand and reason about.
+- Ok I'm having a ton of fun with printing things out based on their type generically (for the INFO command), but it's probably too much of a distraction.
+- The codebase is starting to feel unwieldy and some refactoring is in order.
