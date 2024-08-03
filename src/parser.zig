@@ -1,9 +1,12 @@
+//! Bytes coming in from the client socket are first parsed as a Message, which is then further interpreted as a
+//! Request (a command from the client). The server then handles the Request (state updates are applied) and a response Message is produced.
+//! Finally, the response Message is sent back to the client as a sequence of bytes.
+
 const std = @import("std");
 const net = std.net;
 const stdout = std.io.getStdOut().writer();
 const Cache = @import("RwLockHashMap.zig");
-const server_config = @import("config.zig");
-const Config = server_config.Config;
+const ServerConfig = @import("config.zig").ServerConfig;
 const testing = std.testing;
 const string_utils = @import("string_utils.zig");
 
@@ -24,9 +27,6 @@ const Error = error{
     UnimplementedNonArrayRequest,
 };
 
-// Bytes coming in from the client socket are first parsed as a Message, which is then further interpreted as a
-// Request (a command from the client). The server then handles the Request (state updates are applied) and a response Message is produced.
-// Finally, the response Message is sent back to the client as a sequence of bytes.
 // NOTE: we have to make these into wrapper classes because otherwise these String types would be aliases to []const u8, and then we can't distinguish between the two in the tagged union.
 const SimpleString = struct {
     value: []const u8,
@@ -187,7 +187,7 @@ const MessageType = enum {
         };
     }
 };
-// Does not own the underlying contents (strings).
+/// A Message may or may not own the underlying string data, depending on whether its allocator field is set or not.
 const Message = union(MessageType) {
     simple_string: SimpleString,
     bulk_string: BulkString,
@@ -195,7 +195,7 @@ const Message = union(MessageType) {
 
     const Self = @This();
 
-    // Frees only the Message slice when this Message is an Array. Does not free the contents (strings), since those are not owned by the Messages.
+    /// Frees only the Message slice when this Message is an Array. Does not free the contents (strings), since those are not owned by the Messages.
     pub fn deinit(self: *Self) void {
         switch (self.*) {
             .simple_string => |s| {
@@ -210,15 +210,14 @@ const Message = union(MessageType) {
             },
         }
     }
-    // Caller is responsible for calling deinit() on returned Message, which is only strictly necessary when the returned Message is an Array.
+    /// Caller is responsible for calling deinit() on returned Message, which is only strictly necessary when the returned Message is an Array.
+    /// Depending on the contents of the string, parse it. Examples:
+    /// +OK\r\n --> this is a SimpleString containing "OK".
+    /// $5\r\nhello\r\n --> this is a BulkString containing "hello".
+    /// *2\r\n$2\r\nhi\r\n$3\r\nbye\r\n --> this is an Array with two BulkStrings: first one contains "hi" and the second contains "bye".
     fn fromStr(allocator: std.mem.Allocator, raw_message: []const u8) !Self {
         // The first byte tells you what kind of message this is.
         const message_type = try MessageType.fromByte(raw_message[0]);
-
-        // Depending on the contents of the string, parse it. Examples:
-        // +OK\r\n --> this is a SimpleString containing "OK".
-        // $5\r\nhello\r\n --> this is a BulkString containing "hello".
-        // *2\r\n$2\r\nhi\r\n$3\r\nbye\r\n --> this is an Array with two BulkStrings: first one contains "hi" and the second contains "bye".
 
         // TODO less boilerplate, probably using builtins
         return switch (message_type) {
@@ -227,7 +226,7 @@ const Message = union(MessageType) {
             .array => return .{ .array = try Array.fromStr(allocator, raw_message) },
         };
     }
-    // Caller owns returned string.
+    /// Caller owns returned string.
     fn toStr(self: *const Self, allocator: std.mem.Allocator) Error![]const u8 {
         switch (self.*) {
             .simple_string => {
@@ -242,6 +241,7 @@ const Message = union(MessageType) {
         }
     }
 
+    /// Just gets a view of the underlying string. Array messages are not supported.
     fn get_contents(self: *const Self) Error![]const u8 {
         return switch (self.*) {
             .simple_string => |s| s.value,
@@ -368,7 +368,6 @@ test "Message roundtrip Array" {
 }
 // TODO add tests for case when SimpleString and BulkString have allocators and use them to free.
 
-// Messages from the client are parsed as one of these Requests, which are then processed to produce a Response.
 const PingCommand = struct { contents: ?[]const u8 };
 const EchoCommand = struct { contents: []const u8 };
 const SetCommand = struct { key: []const u8, value: []const u8, expiry: Cache.ExpiryTimestampMs };
@@ -389,6 +388,7 @@ const Command = union(CommandType) {
     info: InfoCommand,
 };
 
+/// Messages from the client are parsed as one of these Requests, which are then processed to produce a Response.
 const Request = struct {
     allocator: std.mem.Allocator,
     command: Command,
@@ -495,6 +495,7 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
     return Error.InvalidRequest;
 }
 
+/// Parse and interpret the given raw_message as a Request from a client. The caller owns the Request and is responsible for calling deinit().
 pub fn parseRequest(allocator: std.mem.Allocator, raw_message: []const u8) !Request {
     // Parse the raw_message into a Message. Make sure to free the message contents when we're done using it.
     var message = try Message.fromStr(allocator, raw_message);
@@ -551,6 +552,7 @@ test "parseRequest SetCommand" {
 // TODO test errors for parseRequest
 // TODO test parseRequest for InfoCommand
 
+/// Given a client request, update any server state if needed.
 pub fn handleRequest(request: Request, cache: *Cache) !void {
     // We only need to update state for SET commands. Everything else is ignored here.
     switch (request.command) {
@@ -597,7 +599,7 @@ test "handleRequest SetCommand" {
     }
 }
 
-fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Cache, config: *const Config) !Message {
+fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Cache, config: *const ServerConfig) !Message {
     switch (request.command) {
         .ping => |p| {
             if (p.contents) |text| {
@@ -619,7 +621,7 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Ca
             return Message{ .simple_string = .{ .value = "OK" } };
         },
         .info => |i| {
-            // A Config consists of multiple sections, e.g. ReplicationConfig is one section.
+            // A ServerConfig consists of multiple sections, e.g. ReplicationConfig is one section.
             // Each section consists of multiple fields.
             // The INFO command will list section keys, and we should print all sections that match those keys.
             // Printing a section means we go over every field in that section and print the field name and field value (name:value).
@@ -629,8 +631,8 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Ca
             // For every section key we are given in the INFO command,
             for (i.section_keys) |section_key| {
                 // TODO for now we just ignore unknown section keys.
-                // Find the section in Config that matches the section_key (e.g. "replication").
-                inline for (@typeInfo(Config).Struct.fields) |section| {
+                // Find the section in ServerConfig that matches the section_key (e.g. "replication").
+                inline for (@typeInfo(ServerConfig).Struct.fields) |section| {
                     if (std.ascii.eqlIgnoreCase(section.name, section_key)) {
                         // Now, take that config section (e.g. ReplicationConfig) and concatenate all its fields as name:value strings.
                         const config_section = @field(config, section.name);
@@ -648,8 +650,8 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Ca
     return error.UnimplementedError;
 }
 
-// Caller owns returned string.
-pub fn getResponse(allocator: std.mem.Allocator, request: Request, cache: *Cache, config: *const Config) ![]const u8 {
+/// Given a Request from a client, return a string message containing the response to send to the client. Caller owns returned string.
+pub fn getResponse(allocator: std.mem.Allocator, request: Request, cache: *Cache, config: *const ServerConfig) ![]const u8 {
     var response_message = try getResponseMessage(allocator, request, cache, config);
     defer response_message.deinit();
 

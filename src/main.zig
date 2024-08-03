@@ -5,7 +5,7 @@ const Cache = @import("RwLockHashMap.zig");
 const parser = @import("parser.zig");
 const cli = @import("cli.zig");
 const server_config = @import("config.zig");
-const Config = server_config.Config;
+const Config = server_config.ServerConfig;
 const testing = std.testing;
 
 fn handleRequestAndRespond(allocator: std.mem.Allocator, raw_message: []const u8, cache: *Cache, config: *const Config, client_stream: anytype) !void {

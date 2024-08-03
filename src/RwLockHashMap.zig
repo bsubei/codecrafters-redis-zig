@@ -1,5 +1,5 @@
 //! Thread-safe hashmap that makes copies of and owns the string keys and string values.
-//!
+//! Supports including expiry timestamps, which will filter out any expired values when get() is called.
 const std = @import("std");
 const RwLock = std.Thread.RwLock;
 const Allocator = std.mem.Allocator;
@@ -31,7 +31,7 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
-// Given strings or u8 slices (key-value pair), insert them into the hash map by copying them.
+/// Given strings or u8 slices (key-value pair), insert them into the hash map by copying them.
 pub fn put(self: *Self, key: K, value: V) !void {
     try self.putWithExpiry(key, value, null);
 }
@@ -58,7 +58,7 @@ pub fn putWithExpiry(self: *Self, key: K, value: V, expiry: ExpiryTimestampMs) !
     }
 }
 
-// Get the value behind the given key if it exists AND if it's not expired.
+/// Get the value behind the given key if it exists AND if it's not expired.
 pub fn get(self: *Self, key: K) ?V {
     self.rwLock.lockShared();
     defer self.rwLock.unlockShared();
@@ -76,7 +76,7 @@ pub fn get(self: *Self, key: K) ?V {
     return null;
 }
 
-// Print out the contents of the hash map.
+/// Print out the contents of the hash map.
 pub fn print(self: *Self) !void {
     self.rwLock.lockShared();
     defer self.rwLock.unlockShared();
@@ -95,6 +95,7 @@ pub fn count(self: *Self) @TypeOf(self.map).Size {
     return self.map.count();
 }
 
+// TODO finish tests
 test "RwLockHashMap basic access patterns" {
     const allocator = std.testing.allocator;
     var map = Self.init(allocator);
@@ -107,18 +108,10 @@ test "RwLockHashMap basic access patterns" {
     const result = map.get("hi");
     try testing.expect(result != null);
     try testing.expectEqualSlices(u8, result.?, "bye");
-
-    // TODO finish tests
 }
 
-test "RwLockHashMap concurrent reads do not lock" {
-    try testing.expect(true);
-}
+// test "RwLockHashMap concurrent reads do not lock" {}
 
-test "RwLockHashMap concurrent reads/writes do lock" {
-    try testing.expect(true);
-}
+// test "RwLockHashMap concurrent reads/writes do lock" {}
 
-test "RwLockHashMap concurrent read/writes are correct" {
-    try testing.expect(true);
-}
+// test "RwLockHashMap concurrent read/writes are correct" {}
