@@ -6,6 +6,7 @@ const Cache = @import("RwLockHashMap.zig");
 const parser = @import("parser.zig");
 const cli = @import("cli.zig");
 const server_config = @import("config.zig");
+const network = @import("network.zig");
 const ServerConfig = server_config.ServerConfig;
 
 fn handleRequestAndRespond(allocator: std.mem.Allocator, raw_message: []const u8, cache: *Cache, config: *const ServerConfig, client_stream: anytype) !void {
@@ -96,8 +97,8 @@ test "handleRequestAndRespond" {
     }
 }
 
-fn handleClient(client_connection: net.Server.Connection, config: *const ServerConfig, cache: *Cache) !void {
-    defer client_connection.stream.close();
+fn handleClient(client_stream: net.Stream, config: *const ServerConfig, cache: *Cache) !void {
+    defer client_stream.close();
 
     // We don't expect each client to use up too much memory, so we use an arena allocator for speed and blow away all the memory at once when we're done.
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -109,29 +110,30 @@ fn handleClient(client_connection: net.Server.Connection, config: *const ServerC
     // The clean alternative would be to read until seeing a delimiter ('\n' for example) or eof, but misbehaving clients could just not send either and block us forever.
     // Since I don't know how to make those calls use timeouts, I'll just call read() one chunk at a time (nonblocking) and concatenate them into the final message.
     var raw_message = std.ArrayList(u8).init(allocator);
-    // No need to dealloc since we're using an arena allocator.
 
     while (true) {
-        // Read one chunk and append it to the raw_message.
-        const num_read_bytes = try parser.readChunk(client_connection, &raw_message);
+        const num_read_bytes = try network.readFromClient(client_stream, &raw_message);
+        if (num_read_bytes == 0) return;
 
-        // Connection closed, leave if there's no pending raw_message to send.
-        if (num_read_bytes == 0 and raw_message.items.len == 0) {
-            return;
-        }
-        // There's possibly more to read for this raw_message! Go back and read another chunk.
-        if (num_read_bytes == parser.CLIENT_READER_CHUNK_SIZE) {
-            continue;
-        }
-
-        try handleRequestAndRespond(allocator, raw_message.items, cache, config, client_connection.stream);
+        try handleRequestAndRespond(allocator, raw_message.items, cache, config, client_stream);
 
         // Clear the message since the client might send more, but don't actually deallocate so we can reuse this for the next message.
         raw_message.clearRetainingCapacity();
     }
 }
 
-fn syncWithMaster() !void {}
+fn loadRdbFile(rdb: parser.RdbFile, cache: *Cache) !void {
+    // TODO take the parsed RDB that master sent and use it to update our state.
+    _ = rdb;
+    _ = cache;
+}
+fn syncWithMaster(cache: *Cache) !void {
+    // Send full sync handshake to master
+    const rdb = try parser.sendSyncHandshakeToMaster();
+
+    // Take the parsed RDB that master sent and use it to update our state.
+    try loadRdbFile(rdb, cache);
+}
 fn listenForClientsAndHandleRequests(address: net.Address, config: *const ServerConfig, cache: *Cache) !void {
     // Keep listening to new client connections, and once one comes in, set it up to be handled be a new thread and go back to listening.
     var listener = try address.listen(.{
@@ -146,7 +148,7 @@ fn listenForClientsAndHandleRequests(address: net.Address, config: *const Server
         try stdout.print("accepted new connection from client {}\n", .{connection.address.in.sa.port});
         // TODO join on these threads for correctness.
         // TODO handle errors coming back from these threads.
-        const t = try std.Thread.spawn(.{}, handleClient, .{ connection, config, cache });
+        const t = try std.Thread.spawn(.{}, handleClient, .{ connection.stream, config, cache });
         t.detach();
     }
 }
@@ -157,7 +159,7 @@ pub fn runMasterServer(args: *const cli.Args, config: *const ServerConfig, cache
 pub fn runSlaveServer(args: *const cli.Args, config: *const ServerConfig, cache: *Cache) !void {
     const address = try net.Address.resolveIp("127.0.0.1", args.port);
 
-    try syncWithMaster();
+    try syncWithMaster(cache);
 
     try listenForClientsAndHandleRequests(address, config, cache);
 }

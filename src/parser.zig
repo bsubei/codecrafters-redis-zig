@@ -10,7 +10,6 @@ const ServerConfig = @import("config.zig").ServerConfig;
 const testing = std.testing;
 const string_utils = @import("string_utils.zig");
 
-pub const CLIENT_READER_CHUNK_SIZE = 1 << 10;
 const CRLF_DELIMITER = "\r\n";
 
 const Error = error{
@@ -660,18 +659,18 @@ pub fn getResponse(allocator: std.mem.Allocator, request: Request, cache: *Cache
 
 // TODO test getResponse
 
-pub fn readChunk(client_connection: net.Server.Connection, message_ptr: *std.ArrayList(u8)) !usize {
-    // Read one chunk.
-    var buf: [CLIENT_READER_CHUNK_SIZE]u8 = undefined;
-    const num_read_bytes = client_connection.stream.read(&buf) catch |err| {
-        // Handle retry, otherwise bubble up any errors.
-        if (err == error.WouldBlock) return readChunk(client_connection, message_ptr);
-        return err;
-    };
-    try stdout.print("Read {d} bytes: {s}\n", .{ num_read_bytes, buf[0..num_read_bytes] });
+pub const RdbFile = struct {};
 
-    // Save this chunk to the message.
-    try message_ptr.appendSlice(buf[0..num_read_bytes]);
+// TODO send full sync handshake to master
+pub fn sendSyncHandshakeToMaster() !RdbFile {
+    // TODO send a ping to master, expect a PONG back
+    const ping = .{ .simple_string = .{ .value = "PING" } };
+    _ = ping;
 
-    return num_read_bytes;
+    // TODO send a REPLCONF to master twice, expecting OK back
+
+    // TODO send a PSYNC to master, expecting FULLRESYNC back
+
+    // TODO expect master to send us an RDB file
+    return .{};
 }
