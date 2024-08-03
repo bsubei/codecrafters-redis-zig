@@ -2,8 +2,12 @@ const std = @import("std");
 const cli = @import("cli.zig");
 const Args = cli.Args;
 
+pub const ServerRole = enum {
+    master,
+    slave,
+};
 pub const ReplicationConfig = struct {
-    role: []const u8,
+    role: ServerRole,
     master_replid: ?[40]u8,
     master_repl_offset: u64,
 };
@@ -26,9 +30,9 @@ pub fn createConfig(args: Args) !Config {
     var replication: ReplicationConfig = undefined;
     if (args.replicaof) |replicaof| {
         _ = replicaof;
-        replication = .{ .role = "slave", .master_replid = null, .master_repl_offset = 0 };
+        replication = .{ .role = .slave, .master_replid = null, .master_repl_offset = 0 };
     } else {
-        replication = .{ .role = "master", .master_replid = try generateId(), .master_repl_offset = 0 };
+        replication = .{ .role = .master, .master_replid = try generateId(), .master_repl_offset = 0 };
     }
     return Config{ .replication = replication };
 }

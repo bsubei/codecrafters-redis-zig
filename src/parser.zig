@@ -5,6 +5,7 @@ const Cache = @import("rw_lock_hashmap.zig").RwLockHashMap;
 const server_config = @import("config.zig");
 const Config = server_config.Config;
 const testing = std.testing;
+const string_utils = @import("string_utils.zig");
 
 pub const CLIENT_READER_CHUNK_SIZE = 1 << 10;
 const CRLF_DELIMITER = "\r\n";
@@ -628,27 +629,14 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Ca
             // For every section key we are given in the INFO command,
             for (i.section_keys) |section_key| {
                 // TODO for now we just ignore unknown section keys.
-                // TODO hide away this monstrosity in some well-named function.
-
                 // Find the section in Config that matches the section_key (e.g. "replication").
                 inline for (@typeInfo(Config).Struct.fields) |section| {
                     if (std.ascii.eqlIgnoreCase(section.name, section_key)) {
                         // Now, take that config section (e.g. ReplicationConfig) and concatenate all its fields as name:value strings.
                         const config_section = @field(config, section.name);
                         inline for (@typeInfo(@TypeOf(config_section)).Struct.fields) |section_field| {
-                            // Skip any optional fields that are not activated.
                             const field_value = @field(config_section, section_field.name);
-                            if (@typeInfo(section_field.type) != .Optional or field_value != null) {
-                                const tmp = concatenated;
-                                defer allocator.free(tmp);
-
-                                // The formatter string depends on the section_field's type, i.e. {s} for strings and {d} for decimals etc.
-                                const formatter_string = comptime getFormatterString(section_field.type);
-                                const line = try std.fmt.allocPrint(allocator, formatter_string, .{ section_field.name, @field(config_section, section_field.name) });
-                                defer allocator.free(line);
-
-                                concatenated = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ concatenated, line });
-                            }
+                            concatenated = try string_utils.appendNameValue(allocator, section_field.type, section_field.name, field_value, concatenated);
                         }
                     }
                 }
@@ -658,42 +646,6 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Ca
         },
     }
     return error.UnimplementedError;
-}
-
-fn isStringType(comptime field: type) bool {
-    switch (@typeInfo(field)) {
-        .Array => |info| {
-            if (info.child == u8) {
-                return true;
-            }
-        },
-        .Pointer => |info| {
-            if ((info.size == .Slice or info.size == .Many) and info.child == u8) {
-                return true;
-            }
-        },
-        else => return false,
-    }
-}
-
-// TODO consider using std.fmt.formatType or something else to reduce the amount of code here.
-fn getFormatterString(comptime T: type) []const u8 {
-    const is_optional = @typeInfo(T) == .Optional;
-    const underlying_type = if (is_optional) @typeInfo(T).Optional.child else T;
-
-    if (isStringType(underlying_type)) {
-        return if (is_optional) "{s}:{?s}\n" else "{s}:{s}\n";
-    } else {
-        return if (is_optional) "{s}:{?d}\n" else "{s}:{d}\n";
-    }
-}
-test "getFormatterString" {
-    try testing.expectEqualSlices(u8, "{s}:{s}\n", getFormatterString([]const u8));
-    try testing.expectEqualSlices(u8, "{s}:{?s}\n", getFormatterString(?[]const u8));
-    try testing.expectEqualSlices(u8, "{s}:{s}\n", getFormatterString([100]u8));
-    try testing.expectEqualSlices(u8, "{s}:{?s}\n", getFormatterString(?[100]u8));
-    try testing.expectEqualSlices(u8, "{s}:{d}\n", getFormatterString(u64));
-    try testing.expectEqualSlices(u8, "{s}:{?d}\n", getFormatterString(?u64));
 }
 
 // Caller owns returned string.

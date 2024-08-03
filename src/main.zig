@@ -146,15 +146,14 @@ fn handleClient(client_connection: net.Server.Connection, cache: *Cache, config:
     }
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var args = try cli.parseArgs(allocator);
-    defer args.deinit();
-
+fn runMasterServer(allocator: std.mem.Allocator, cache: Cache, config: Config) !void {
+    _ = allocator;
+    _ = cache;
+    _ = config;
+}
+fn runServer(allocator: std.mem.Allocator, args: cli.Args) !void {
     var config = try server_config.createConfig(args);
+    // if (config.replication.role
 
     var cache = Cache.init(allocator);
     defer cache.deinit();
@@ -178,4 +177,14 @@ pub fn main() !void {
         const t = try std.Thread.spawn(.{}, handleClient, .{ connection, &cache, &config });
         t.detach();
     }
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var args = try cli.parseArgs(allocator);
+    try runServer(allocator, args);
+    defer args.deinit();
 }
