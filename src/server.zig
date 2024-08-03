@@ -9,6 +9,10 @@ const server_config = @import("config.zig");
 const network = @import("network.zig");
 const ServerConfig = server_config.ServerConfig;
 
+const Error = error{
+    badConfiguration,
+};
+
 fn handleRequestAndRespond(allocator: std.mem.Allocator, raw_message: []const u8, cache: *Cache, config: *const ServerConfig, client_stream: anytype) !void {
     // Parse the raw_message into a Request (a command from the client).
     var request = try parser.parseRequest(allocator, raw_message);
@@ -104,15 +108,11 @@ fn handleClient(client_stream: net.Stream, config: *const ServerConfig, cache: *
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-
-    // Because the client will send data and wait for our reply before closing the socket connection, we can't just "read all bytes" from the stream
-    // then parse them at our leisure, since we would block forever waiting for end of stream which will never come.
-    // The clean alternative would be to read until seeing a delimiter ('\n' for example) or eof, but misbehaving clients could just not send either and block us forever.
-    // Since I don't know how to make those calls use timeouts, I'll just call read() one chunk at a time (nonblocking) and concatenate them into the final message.
     var raw_message = std.ArrayList(u8).init(allocator);
+    defer raw_message.deinit();
 
     while (true) {
-        const num_read_bytes = try network.readFromClient(client_stream, &raw_message);
+        const num_read_bytes = try network.readFromStream(client_stream, &raw_message);
         if (num_read_bytes == 0) return;
 
         try handleRequestAndRespond(allocator, raw_message.items, cache, config, client_stream);
@@ -127,9 +127,9 @@ fn loadRdbFile(rdb: parser.RdbFile, cache: *Cache) !void {
     _ = rdb;
     _ = cache;
 }
-fn syncWithMaster(cache: *Cache) !void {
+fn syncWithMaster(allocator: std.mem.Allocator, master_stream: net.Stream, cache: *Cache) !void {
     // Send full sync handshake to master
-    const rdb = try parser.sendSyncHandshakeToMaster();
+    const rdb = try parser.sendSyncHandshakeToMaster(allocator, master_stream);
 
     // Take the parsed RDB that master sent and use it to update our state.
     try loadRdbFile(rdb, cache);
@@ -153,13 +153,25 @@ fn listenForClientsAndHandleRequests(address: net.Address, config: *const Server
     }
 }
 pub fn runMasterServer(args: *const cli.Args, config: *const ServerConfig, cache: *Cache) !void {
-    const address = try net.Address.resolveIp("127.0.0.1", args.port);
-    try listenForClientsAndHandleRequests(address, config, cache);
+    const our_address = try net.Address.resolveIp("127.0.0.1", args.port);
+    try listenForClientsAndHandleRequests(our_address, config, cache);
 }
 pub fn runSlaveServer(args: *const cli.Args, config: *const ServerConfig, cache: *Cache) !void {
-    const address = try net.Address.resolveIp("127.0.0.1", args.port);
+    const our_address = try net.Address.resolveIp("127.0.0.1", args.port);
 
-    try syncWithMaster(cache);
+    // Set up an arena allocator backed by a page allocator. We only need it for syncWithMaster.
+    {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
 
-    try listenForClientsAndHandleRequests(address, config, cache);
+        // Connect to master.
+        if (args.replicaof == null) return Error.badConfiguration;
+        var master_stream = try std.net.tcpConnectToHost(allocator, args.replicaof.?.master_host, args.replicaof.?.master_port);
+        defer master_stream.close();
+
+        try syncWithMaster(allocator, master_stream, cache);
+    }
+
+    try listenForClientsAndHandleRequests(our_address, config, cache);
 }

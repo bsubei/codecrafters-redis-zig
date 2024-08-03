@@ -9,6 +9,7 @@ const Cache = @import("RwLockHashMap.zig");
 const ServerConfig = @import("config.zig").ServerConfig;
 const testing = std.testing;
 const string_utils = @import("string_utils.zig");
+const network = @import("network.zig");
 
 const CRLF_DELIMITER = "\r\n";
 
@@ -24,6 +25,7 @@ const Error = error{
     InvalidRequestEmptyMessage,
     InvalidRequestNumberOfArgs,
     UnimplementedNonArrayRequest,
+    FailedSyncHandshake,
 };
 
 // NOTE: we have to make these into wrapper classes because otherwise these String types would be aliases to []const u8, and then we can't distinguish between the two in the tagged union.
@@ -662,10 +664,20 @@ pub fn getResponse(allocator: std.mem.Allocator, request: Request, cache: *Cache
 pub const RdbFile = struct {};
 
 // TODO send full sync handshake to master
-pub fn sendSyncHandshakeToMaster() !RdbFile {
-    // TODO send a ping to master, expect a PONG back
-    const ping = .{ .simple_string = .{ .value = "PING" } };
-    _ = ping;
+pub fn sendSyncHandshakeToMaster(allocator: std.mem.Allocator, master_stream: net.Stream) !RdbFile {
+    // Send a ping to master, expect a PONG back
+    const ping = Message{ .array = .{ .allocator = allocator, .elements = &[_]Message{.{ .bulk_string = .{ .value = "PING" } }} } };
+    try master_stream.writeAll(try ping.toStr(allocator));
+    var buffer = std.ArrayList(u8).init(allocator);
+    defer buffer.deinit();
+    const num_read_bytes = try network.readFromStream(master_stream, &buffer);
+    if (num_read_bytes == 0) return Error.FailedSyncHandshake;
+    var response = try Message.fromStr(allocator, buffer.items);
+    defer response.deinit();
+    switch (response) {
+        .simple_string => |s| if (!std.ascii.eqlIgnoreCase(s.value, "pong")) return Error.FailedSyncHandshake,
+        else => return Error.FailedSyncHandshake,
+    }
 
     // TODO send a REPLCONF to master twice, expecting OK back
 
