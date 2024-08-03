@@ -44,7 +44,7 @@ const SimpleString = struct {
     }
     fn fromStrAlloc(allocator: std.mem.Allocator, raw_message: []const u8) Error!Self {
         const str = try fromStr(raw_message);
-        return SimpleString{ .allocator = allocator, .value = try allocator.dupe(u8, str.value) };
+        return .{ .allocator = allocator, .value = try allocator.dupe(u8, str.value) };
     }
     fn toStr(self: *const Self, allocator: std.mem.Allocator) Error![]const u8 {
         return std.fmt.allocPrint(allocator, "+{s}{s}", .{ self.value, CRLF_DELIMITER });
@@ -78,7 +78,7 @@ const BulkString = struct {
     }
     fn fromStrAlloc(allocator: std.mem.Allocator, raw_message: []const u8) Error!Self {
         const str = try fromStr(raw_message);
-        return SimpleString{ .allocator = allocator, .value = try allocator.dupe(u8, str.value) };
+        return .{ .allocator = allocator, .value = try allocator.dupe(u8, str.value) };
     }
     fn toStr(self: *const Self, allocator: std.mem.Allocator) Error![]const u8 {
         // Special case, handle null bulk string.
@@ -332,8 +332,8 @@ test "Message toStr BulkString" {
 }
 test "Message toStr Array" {
     {
-        const first = Message{ .bulk_string = .{ .value = "first" } };
-        const last = Message{ .simple_string = .{ .value = "last" } };
+        const first = .{ .bulk_string = .{ .value = "first" } };
+        const last = .{ .simple_string = .{ .value = "last" } };
         const message = Message{ .array = .{ .elements = &[_]Message{ first, last }, .allocator = testing.allocator } };
         const msg_str = try message.toStr(testing.allocator);
         defer testing.allocator.free(msg_str);
@@ -355,8 +355,8 @@ test "Message roundtrip BulkString" {
     try testing.expectEqualSlices(u8, msg.bulk_string.value, msg_again.bulk_string.value);
 }
 test "Message roundtrip Array" {
-    const first = Message{ .bulk_string = .{ .value = "first" } };
-    const last = Message{ .simple_string = .{ .value = "last" } };
+    const first = .{ .bulk_string = .{ .value = "first" } };
+    const last = .{ .simple_string = .{ .value = "last" } };
     const msg = Message{ .array = .{ .elements = &[_]Message{ first, last }, .allocator = testing.allocator } };
     const msg_str = try msg.toStr(testing.allocator);
     defer testing.allocator.free(msg_str);
@@ -603,22 +603,22 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Ca
     switch (request.command) {
         .ping => |p| {
             if (p.contents) |text| {
-                return Message{ .bulk_string = .{ .value = text } };
+                return .{ .bulk_string = .{ .value = text } };
             }
-            return Message{ .simple_string = .{ .value = "PONG" } };
+            return .{ .simple_string = .{ .value = "PONG" } };
         },
         .echo => |e| {
-            return Message{ .bulk_string = .{ .value = e.contents } };
+            return .{ .bulk_string = .{ .value = e.contents } };
         },
         .get => |g| {
             const value = cache.get(g.key);
             if (value) |v| {
-                return Message{ .bulk_string = .{ .value = v } };
+                return .{ .bulk_string = .{ .value = v } };
             }
-            return Message{ .bulk_string = .{ .value = "" } };
+            return .{ .bulk_string = .{ .value = "" } };
         },
         .set => {
-            return Message{ .simple_string = .{ .value = "OK" } };
+            return .{ .simple_string = .{ .value = "OK" } };
         },
         .info => |i| {
             // A ServerConfig consists of multiple sections, e.g. ReplicationConfig is one section.
@@ -644,7 +644,7 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Ca
                 }
             }
             // NOTE: we set the allocator for this Message because we want deinit() to free up the value string.
-            return Message{ .bulk_string = .{ .value = concatenated, .allocator = allocator } };
+            return .{ .bulk_string = .{ .value = concatenated, .allocator = allocator } };
         },
     }
     return error.UnimplementedError;

@@ -1,14 +1,14 @@
 const std = @import("std");
 const net = std.net;
 const stdout = std.io.getStdOut().writer();
+const testing = std.testing;
 const Cache = @import("RwLockHashMap.zig");
 const parser = @import("parser.zig");
 const cli = @import("cli.zig");
 const server_config = @import("config.zig");
-const Config = server_config.ServerConfig;
-const testing = std.testing;
+const ServerConfig = server_config.ServerConfig;
 
-fn handleRequestAndRespond(allocator: std.mem.Allocator, raw_message: []const u8, cache: *Cache, config: *const Config, client_stream: anytype) !void {
+fn handleRequestAndRespond(allocator: std.mem.Allocator, raw_message: []const u8, cache: *Cache, config: *const ServerConfig, client_stream: anytype) !void {
     // Parse the raw_message into a Request (a command from the client).
     var request = try parser.parseRequest(allocator, raw_message);
     defer request.deinit();
@@ -96,7 +96,7 @@ test "handleRequestAndRespond" {
     }
 }
 
-fn handleClient(client_connection: net.Server.Connection, config: *const Config, cache: *Cache) !void {
+fn handleClient(client_connection: net.Server.Connection, config: *const ServerConfig, cache: *Cache) !void {
     defer client_connection.stream.close();
 
     // We don't expect each client to use up too much memory, so we use an arena allocator for speed and blow away all the memory at once when we're done.
@@ -132,7 +132,7 @@ fn handleClient(client_connection: net.Server.Connection, config: *const Config,
 }
 
 fn syncWithMaster() !void {}
-fn listenForClientsAndHandleRequests(address: net.Address, config: *const Config, cache: *Cache) !void {
+fn listenForClientsAndHandleRequests(address: net.Address, config: *const ServerConfig, cache: *Cache) !void {
     // Keep listening to new client connections, and once one comes in, set it up to be handled be a new thread and go back to listening.
     var listener = try address.listen(.{
         .reuse_address = true,
@@ -150,11 +150,11 @@ fn listenForClientsAndHandleRequests(address: net.Address, config: *const Config
         t.detach();
     }
 }
-pub fn runMasterServer(args: *const cli.Args, config: *const Config, cache: *Cache) !void {
+pub fn runMasterServer(args: *const cli.Args, config: *const ServerConfig, cache: *Cache) !void {
     const address = try net.Address.resolveIp("127.0.0.1", args.port);
     try listenForClientsAndHandleRequests(address, config, cache);
 }
-pub fn runSlaveServer(args: *const cli.Args, config: *const Config, cache: *Cache) !void {
+pub fn runSlaveServer(args: *const cli.Args, config: *const ServerConfig, cache: *Cache) !void {
     const address = try net.Address.resolveIp("127.0.0.1", args.port);
 
     try syncWithMaster();
