@@ -480,7 +480,7 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
                 var temp_list = std.ArrayList([]const u8).init(allocator);
                 errdefer temp_list.deinit();
                 for (section_messages) |msg| {
-                    try temp_list.append(try msg.get_contents());
+                    try temp_list.append(try allocator.dupe(u8, try msg.get_contents()));
                 }
                 // We transfer ownership of the section_keys within the Request to the caller.
                 return Request{ .command = Command{ .info = .{ .section_keys = try temp_list.toOwnedSlice() } }, .allocator = allocator };
@@ -618,18 +618,15 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Ca
             return Message{ .simple_string = .{ .value = "OK" } };
         },
         .info => |i| {
-            var concatenated: []const u8 = try allocator.alloc(u8, 0);
-            errdefer allocator.free(concatenated);
             // A Config consists of multiple sections, e.g. ReplicationConfig is one section.
             // Each section consists of multiple fields.
             // The INFO command will list section keys, and we should print all sections that match those keys.
             // Printing a section means we go over every field in that section and print the field name and field value (name:value).
 
+            var concatenated: []const u8 = try allocator.alloc(u8, 0);
+
             // For every section key we are given in the INFO command,
             for (i.section_keys) |section_key| {
-                const tmp = concatenated;
-                defer allocator.free(tmp);
-
                 // TODO for now we just ignore unknown section keys.
                 // TODO hide away this monstrosity in some well-named function.
 
@@ -642,19 +639,22 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, cache: *Ca
                             // Skip any optional fields that are not activated.
                             const field_value = @field(config_section, section_field.name);
                             if (@typeInfo(section_field.type) != .Optional or field_value != null) {
+                                const tmp = concatenated;
+                                defer allocator.free(tmp);
+
                                 // The formatter string depends on the section_field's type, i.e. {s} for strings and {d} for decimals etc.
                                 const formatter_string = comptime getFormatterString(section_field.type);
                                 const line = try std.fmt.allocPrint(allocator, formatter_string, .{ section_field.name, @field(config_section, section_field.name) });
                                 defer allocator.free(line);
 
                                 concatenated = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ concatenated, line });
-                                allocator.free(tmp);
                             }
                         }
                     }
                 }
             }
-            return Message{ .bulk_string = .{ .value = concatenated } };
+            // NOTE: we set the allocator for this Message because we want deinit() to free up the value string.
+            return Message{ .bulk_string = .{ .value = concatenated, .allocator = allocator } };
         },
     }
     return error.UnimplementedError;
@@ -668,7 +668,7 @@ fn isStringType(comptime field: type) bool {
             }
         },
         .Pointer => |info| {
-            if (info.size == .Slice and info.child == u8) {
+            if ((info.size == .Slice or info.size == .Many) and info.child == u8) {
                 return true;
             }
         },
@@ -676,9 +676,10 @@ fn isStringType(comptime field: type) bool {
     }
 }
 
-fn getFormatterString(comptime field: type) []const u8 {
-    const is_optional = @typeInfo(field) == .Optional;
-    const underlying_type = if (is_optional) @typeInfo(field).Optional.child else field;
+// TODO consider using std.fmt.formatType or something else to reduce the amount of code here.
+fn getFormatterString(comptime T: type) []const u8 {
+    const is_optional = @typeInfo(T) == .Optional;
+    const underlying_type = if (is_optional) @typeInfo(T).Optional.child else T;
 
     if (isStringType(underlying_type)) {
         return if (is_optional) "{s}:{?s}\n" else "{s}:{s}\n";

@@ -27,34 +27,89 @@ fn handleRequestAndRespond(allocator: std.mem.Allocator, raw_message: []const u8
 test "handleRequestAndRespond" {
     var cache = Cache.init(testing.allocator);
     defer cache.deinit();
-    const args = cli.Args{ .port = 123, .replicaof = null, .allocator = testing.allocator };
-    var config = try server_config.createConfig(args);
+    const master_args = cli.Args{ .port = 123, .replicaof = null, .allocator = testing.allocator };
+    const master_config = try server_config.createConfig(master_args);
     {
         var buffer: [64]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buffer);
-        try handleRequestAndRespond(testing.allocator, "*2\r\n$4\r\nECHO\r\n$13\r\nHello, world!\r\n", &cache, &config, fbs.writer());
+        try handleRequestAndRespond(testing.allocator, "*2\r\n$4\r\nECHO\r\n$13\r\nHello, world!\r\n", &cache, &master_config, fbs.writer());
         try testing.expectEqualSlices(u8, "$13\r\nHello, world!\r\n", fbs.getWritten());
     }
     {
         var buffer: [64]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buffer);
-        try handleRequestAndRespond(testing.allocator, "*2\r\n$3\r\ngEt\r\n$13\r\nHello, world!\r\n", &cache, &config, fbs.writer());
+        try handleRequestAndRespond(testing.allocator, "*2\r\n$3\r\ngEt\r\n$13\r\nHello, world!\r\n", &cache, &master_config, fbs.writer());
         try testing.expectEqualSlices(u8, "$-1\r\n", fbs.getWritten());
     }
     {
         var buffer: [64]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buffer);
-        try handleRequestAndRespond(testing.allocator, "*3\r\n$3\r\nSEt\r\n$13\r\nHello, world!\r\n$4\r\nbye!\r\n", &cache, &config, fbs.writer());
+        try handleRequestAndRespond(testing.allocator, "*3\r\n$3\r\nSEt\r\n$13\r\nHello, world!\r\n$4\r\nbye!\r\n", &cache, &master_config, fbs.writer());
         try testing.expectEqualSlices(u8, "+OK\r\n", fbs.getWritten());
     }
     {
         var buffer: [64]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buffer);
-        try handleRequestAndRespond(testing.allocator, "*2\r\n$3\r\ngEt\r\n$13\r\nHello, world!\r\n", &cache, &config, fbs.writer());
+        try handleRequestAndRespond(testing.allocator, "*2\r\n$3\r\ngEt\r\n$13\r\nHello, world!\r\n", &cache, &master_config, fbs.writer());
         try testing.expectEqualSlices(u8, "$4\r\nbye!\r\n", fbs.getWritten());
     }
+    {
+        var buffer: [128]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buffer);
+        try handleRequestAndRespond(testing.allocator, "*2\r\n$4\r\nINfo\r\n$11\r\nrePLicAtion\r\n", &cache, &master_config, fbs.writer());
+        var iter = std.mem.splitScalar(u8, fbs.getWritten(), '\n');
+        {
+            const line = iter.next();
+            try testing.expect(line != null);
+            try testing.expectEqualStrings("$91\r", line.?);
+        }
+        {
+            const line = iter.next();
+            try testing.expect(line != null);
+            try testing.expectEqualStrings("", line.?);
+        }
+        {
+            const line = iter.next();
+            try testing.expect(line != null);
+            try testing.expectEqualStrings("role:master", line.?);
+        }
+        {
+            const line = iter.next();
+            try testing.expect(line != null);
+            try testing.expectEqualStrings("", line.?);
+        }
+        {
+            const line = iter.next();
+            try testing.expect(line != null);
+            try testing.expectStringStartsWith(line.?, "master_replid:");
+            try testing.expectEqual("master_replid:".len + 40, line.?.len);
+        }
+        {
+            const line = iter.next();
+            try testing.expect(line != null);
+            try testing.expectEqualStrings("", line.?);
+        }
+        {
+            const line = iter.next();
+            try testing.expect(line != null);
+            try testing.expectEqualStrings("master_repl_offset:0", line.?);
+        }
+        {
+            const line = iter.next();
+            try testing.expect(line != null);
+            try testing.expectEqualStrings("\r", line.?);
+        }
+        {
+            const line = iter.next();
+            try testing.expect(line != null);
+            try testing.expectEqualStrings("", line.?);
+        }
+        {
+            const line = iter.next();
+            try testing.expect(line == null);
+        }
+    }
 }
-// TODO add a test for INFO
 
 fn handleClient(client_connection: net.Server.Connection, cache: *Cache, config: *const Config) !void {
     defer client_connection.stream.close();
