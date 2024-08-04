@@ -7,9 +7,7 @@ const parser = @import("parser.zig");
 const ServerState = @import("ServerState.zig");
 const network = @import("network.zig");
 
-const Error = error{
-    badConfiguration,
-};
+const Error = error{};
 
 pub fn runServer(state: *ServerState) !void {
     switch (state.getInfoSectionsThreadSafe().replication.role) {
@@ -135,9 +133,9 @@ fn loadRdbFile(rdb: parser.RdbFile, state: *ServerState) !void {
     _ = rdb;
     _ = state;
 }
-fn syncWithMaster(allocator: std.mem.Allocator, master_stream: net.Stream, state: *ServerState) !void {
+fn syncWithMaster(allocator: std.mem.Allocator, state: *ServerState) !void {
     // Send full sync handshake to master
-    const rdb = try parser.sendSyncHandshakeToMaster(allocator, master_stream);
+    const rdb = try parser.sendSyncHandshakeToMaster(allocator, state);
 
     // Take the parsed RDB that master sent and use it to update our state.
     try loadRdbFile(rdb, state);
@@ -172,12 +170,7 @@ pub fn runSlaveServer(state: *ServerState) !void {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-
-        // Connect to master and ask it to sync. This blocks (does not listen to incoming connections) until finished.
-        if (state.replicaof == null) return Error.badConfiguration;
-        var master_stream = try std.net.tcpConnectToHost(allocator, state.replicaof.?.master_host, state.replicaof.?.master_port);
-        defer master_stream.close();
-        try syncWithMaster(allocator, master_stream, state);
+        try syncWithMaster(allocator, state);
     }
 
     try listenForClientsAndHandleRequests(our_address, state);

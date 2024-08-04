@@ -26,6 +26,7 @@ const Error = error{
     InvalidRequestNumberOfArgs,
     UnimplementedNonArrayRequest,
     FailedSyncHandshake,
+    BadConfiguration,
 };
 
 // NOTE: we have to make these into wrapper classes because otherwise these String types would be aliases to []const u8, and then we can't distinguish between the two in the tagged union.
@@ -91,7 +92,7 @@ const BulkString = struct {
 };
 const Array = struct {
     elements: []const Message,
-    allocator: std.mem.Allocator,
+    allocator: ?std.mem.Allocator = null,
 
     const Self = @This();
     fn fromStr(allocator: std.mem.Allocator, raw_message: []const u8) Error!Self {
@@ -206,8 +207,8 @@ const Message = union(MessageType) {
                 if (b.allocator) |alloc| alloc.free(b.value);
             },
             .array => |arr| {
-                // NOTE: we don't need to recursively free because our elements are guaranteed never to be Arrays themselves.
-                arr.allocator.free(arr.elements);
+                // NOTE: we don't need to recursively free the elements because they are guaranteed never to be Arrays themselves.
+                if (arr.allocator) |alloc| alloc.free(arr.elements);
             },
         }
     }
@@ -441,8 +442,8 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
             // TODO surely I can get a comptime func to match against the first_word here? Or at least just get the name of the enum field
             if (std.ascii.eqlIgnoreCase(first_word, "ping")) {
                 switch (messages.len) {
-                    1 => return Request{ .command = Command{ .ping = .{ .contents = null } }, .allocator = undefined },
-                    2 => return Request{ .command = Command{ .ping = .{ .contents = @as(?[]const u8, try allocator.dupe(u8, try messages[1].get_contents())) } }, .allocator = allocator },
+                    1 => return .{ .command = .{ .ping = .{ .contents = null } }, .allocator = undefined },
+                    2 => return .{ .command = .{ .ping = .{ .contents = @as(?[]const u8, try allocator.dupe(u8, try messages[1].get_contents())) } }, .allocator = allocator },
                     else => {
                         return Error.InvalidRequestNumberOfArgs;
                     },
@@ -450,7 +451,7 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
             }
             if (std.ascii.eqlIgnoreCase(first_word, "echo")) {
                 switch (messages.len) {
-                    2 => return Request{ .command = Command{ .echo = .{ .contents = try allocator.dupe(u8, try messages[1].get_contents()) } }, .allocator = allocator },
+                    2 => return .{ .command = .{ .echo = .{ .contents = try allocator.dupe(u8, try messages[1].get_contents()) } }, .allocator = allocator },
                     else => {
                         return Error.InvalidRequestNumberOfArgs;
                     },
@@ -458,7 +459,7 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
             }
             if (std.ascii.eqlIgnoreCase(first_word, "get")) {
                 switch (messages.len) {
-                    2 => return Request{ .command = Command{ .get = .{ .key = try allocator.dupe(u8, try messages[1].get_contents()) } }, .allocator = allocator },
+                    2 => return .{ .command = .{ .get = .{ .key = try allocator.dupe(u8, try messages[1].get_contents()) } }, .allocator = allocator },
                     else => {
                         return Error.InvalidRequestNumberOfArgs;
                     },
@@ -478,7 +479,7 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
                         else
                             null;
 
-                        return Request{ .command = Command{ .set = .{ .key = key, .value = value, .expiry = expiry } }, .allocator = allocator };
+                        return .{ .command = .{ .set = .{ .key = key, .value = value, .expiry = expiry } }, .allocator = allocator };
                     },
                     else => {
                         return Error.InvalidRequestNumberOfArgs;
@@ -495,9 +496,12 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
                     try temp_list.append(try allocator.dupe(u8, try msg.get_contents()));
                 }
                 // We transfer ownership of the arguments within the Request to the caller.
-                return Request{ .command = Command{ .info = .{ .arguments = try temp_list.toOwnedSlice() } }, .allocator = allocator };
+                return .{ .command = .{ .info = .{ .arguments = try temp_list.toOwnedSlice() } }, .allocator = allocator };
             }
-            // TODO handle replconf as master server
+            // TODO finish handling replconf as master server
+            if (std.ascii.eqlIgnoreCase(first_word, "replconf")) {
+                return .{ .command = .{ .replconf = .{ .arguments = undefined } }, .allocator = allocator };
+            }
         },
         else => {
             // TODO think about implementing simple_string or bulk_string as a request.
@@ -582,12 +586,12 @@ test "handleRequest no effect" {
     defer state.deinit();
     try testing.expectEqual(0, state.cache.count());
     {
-        const request = Request{ .allocator = undefined, .command = Command{ .echo = EchoCommand{ .contents = "can you hear me?" } } };
+        const request = Request{ .allocator = undefined, .command = .{ .echo = .{ .contents = "can you hear me?" } } };
         try handleRequest(request, &state);
         try testing.expectEqual(0, state.cache.count());
     }
     {
-        const request = Request{ .allocator = undefined, .command = Command{ .get = GetCommand{ .key = "does not exist" } } };
+        const request = Request{ .allocator = undefined, .command = .{ .get = .{ .key = "does not exist" } } };
         try handleRequest(request, &state);
         try testing.expectEqual(0, state.cache.count());
     }
@@ -598,7 +602,7 @@ test "handleRequest SetCommand" {
 
     try testing.expectEqual(0, state.cache.count());
     {
-        const request = Request{ .allocator = undefined, .command = Command{ .set = SetCommand{ .key = "key1", .value = "value1", .expiry = null } } };
+        const request = Request{ .allocator = undefined, .command = .{ .set = .{ .key = "key1", .value = "value1", .expiry = null } } };
         try handleRequest(request, &state);
         try testing.expectEqual(1, state.cache.count());
         try testing.expectEqualSlices(u8, "value1", state.cacheGetThreadSafe("key1").?);
@@ -606,7 +610,7 @@ test "handleRequest SetCommand" {
     {
         // NOTE: even though it's usually a bad idea to write unit tests that depend on timing, this should be fine since we're putting in
         // a big negative expiry. It's unlikely that the system clock will jump back by more than 100 days in the past in between calling cache.putWithExpiry() and cache.get().
-        const request = Request{ .allocator = undefined, .command = Command{ .set = SetCommand{ .key = "key1", .value = "value1000", .expiry = -100 * std.time.ms_per_day } } };
+        const request = Request{ .allocator = undefined, .command = .{ .set = .{ .key = "key1", .value = "value1000", .expiry = -100 * std.time.ms_per_day } } };
         try handleRequest(request, &state);
         // Replacing the same key with a new value should result in the same count.
         try testing.expectEqual(1, state.cache.count());
@@ -683,24 +687,70 @@ pub fn getResponse(allocator: std.mem.Allocator, request: Request, state: *Serve
 pub const RdbFile = struct {};
 
 // TODO send full sync handshake to master
-pub fn sendSyncHandshakeToMaster(allocator: std.mem.Allocator, master_stream: net.Stream) !RdbFile {
+pub fn sendSyncHandshakeToMaster(allocator: std.mem.Allocator, state: *ServerState) !RdbFile {
+    // Connect to master and ask it to sync. This blocks (does not listen to incoming connections) until finished.
+    if (state.replicaof == null) return Error.BadConfiguration;
+    var master_stream = try std.net.tcpConnectToHost(allocator, state.replicaof.?.master_host, state.replicaof.?.master_port);
+    defer master_stream.close();
+
     // Send a ping to master, expect a PONG back
-    const ping = Message{ .array = .{ .allocator = allocator, .elements = &[_]Message{.{ .bulk_string = .{ .value = "PING" } }} } };
-    try master_stream.writeAll(try ping.toStr(allocator));
-    var buffer = std.ArrayList(u8).init(allocator);
-    defer buffer.deinit();
-    const num_read_bytes = try network.readFromStream(master_stream, &buffer);
-    if (num_read_bytes == 0) return Error.FailedSyncHandshake;
-    var response = try Message.fromStr(allocator, buffer.items);
-    defer response.deinit();
-    switch (response) {
-        .simple_string => |s| if (!std.ascii.eqlIgnoreCase(s.value, "pong")) return Error.FailedSyncHandshake,
-        else => return Error.FailedSyncHandshake,
+    {
+        const ping = Message{ .array = .{ .allocator = allocator, .elements = &[_]Message{.{ .bulk_string = .{ .value = "PING" } }} } };
+        try master_stream.writeAll(try ping.toStr(allocator));
+        var response_buffer = std.ArrayList(u8).init(allocator);
+        defer response_buffer.deinit();
+        const num_read_bytes = try network.readFromStream(master_stream, &response_buffer);
+        if (num_read_bytes == 0) return Error.FailedSyncHandshake;
+        var response = try Message.fromStr(allocator, response_buffer.items);
+        defer response.deinit();
+        switch (response) {
+            .simple_string => |s| if (!std.ascii.eqlIgnoreCase(s.value, "pong")) return Error.FailedSyncHandshake,
+            else => return Error.FailedSyncHandshake,
+        }
     }
 
     // TODO send a REPLCONF to master twice, expecting OK back
-    // const master_port=
-    // Command{.replconf = .{.arguments = {"listening-port", "6380"}}}
+    {
+        // NOTE: it's fine to put this on the stack since its lifetime is as long as this function.
+        var port_buf: [8]u8 = undefined;
+        const len = std.fmt.formatIntBuf(&port_buf, state.port, 10, .lower, .{});
+        const port = port_buf[0..len];
+
+        {
+            // Send first REPLCONF: REPLCONF listening-port <port>
+            const msgs = [_]Message{ .{ .bulk_string = .{ .value = "REPLCONF" } }, .{ .bulk_string = .{ .value = "listening-port" } }, .{ .bulk_string = .{ .value = port } } };
+            const first_replconf = Message{ .array = .{ .allocator = allocator, .elements = &msgs } };
+            try master_stream.writeAll(try first_replconf.toStr(allocator));
+            // Expect OK.
+            var response_buffer = std.ArrayList(u8).init(allocator);
+            defer response_buffer.deinit();
+            const num_read_bytes = try network.readFromStream(master_stream, &response_buffer);
+            if (num_read_bytes == 0) return Error.FailedSyncHandshake;
+            var response = try Message.fromStr(allocator, response_buffer.items);
+            defer response.deinit();
+            switch (response) {
+                .simple_string => |s| if (!std.ascii.eqlIgnoreCase(s.value, "OK")) return Error.FailedSyncHandshake,
+                else => return Error.FailedSyncHandshake,
+            }
+        }
+        {
+            // Send second REPLCONF: REPLCONF capa psync2
+            const msgs = [_]Message{ .{ .bulk_string = .{ .value = "REPLCONF" } }, .{ .bulk_string = .{ .value = "capa" } }, .{ .bulk_string = .{ .value = "psync2" } } };
+            const first_replconf = Message{ .array = .{ .elements = &msgs } };
+            try master_stream.writeAll(try first_replconf.toStr(allocator));
+            // Expect OK.
+            var response_buffer = std.ArrayList(u8).init(allocator);
+            defer response_buffer.deinit();
+            const num_read_bytes = try network.readFromStream(master_stream, &response_buffer);
+            if (num_read_bytes == 0) return Error.FailedSyncHandshake;
+            var response = try Message.fromStr(allocator, response_buffer.items);
+            defer response.deinit();
+            switch (response) {
+                .simple_string => |s| if (!std.ascii.eqlIgnoreCase(s.value, "OK")) return Error.FailedSyncHandshake,
+                else => return Error.FailedSyncHandshake,
+            }
+        }
+    }
 
     // TODO send a PSYNC to master, expecting FULLRESYNC back
 
