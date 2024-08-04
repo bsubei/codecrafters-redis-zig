@@ -376,6 +376,7 @@ const SetCommand = struct { key: []const u8, value: []const u8, expiry: Cache.Ex
 const GetCommand = struct { key: []const u8 };
 const InfoCommand = struct { arguments: [][]const u8 };
 const ReplconfCommand = struct { arguments: [][]const u8 };
+const PsyncCommand = struct { replicationid: []const u8, offset: u64 };
 const CommandType = enum {
     ping,
     echo,
@@ -383,6 +384,7 @@ const CommandType = enum {
     get,
     info,
     replconf,
+    psync,
 };
 // TODO I'm starting to think I need to either rename this or something to account for the fact that these can be sent by a server to respond to requests.
 const Command = union(CommandType) {
@@ -392,6 +394,7 @@ const Command = union(CommandType) {
     get: GetCommand,
     info: InfoCommand,
     replconf: ReplconfCommand,
+    psync: PsyncCommand,
 };
 
 /// Messages from the client are parsed as one of these Requests, which are then processed to produce a Response.
@@ -426,6 +429,9 @@ const Request = struct {
                     self.allocator.free(arg);
                 }
                 self.allocator.free(r.arguments);
+            },
+            .psync => |p| {
+                self.allocator.free(p.replicationid);
             },
         }
     }
@@ -500,7 +506,11 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
             }
             // TODO finish handling replconf as master server
             if (std.ascii.eqlIgnoreCase(first_word, "replconf")) {
-                return .{ .command = .{ .replconf = .{ .arguments = undefined } }, .allocator = allocator };
+                return .{ .command = .{ .replconf = .{ .arguments = try allocator.alloc([]const u8, 0) } }, .allocator = allocator };
+            }
+            // TODO finish handling psync as master server
+            if (std.ascii.eqlIgnoreCase(first_word, "psync")) {
+                return .{ .command = .{ .psync = .{ .replicationid = try allocator.alloc(u8, 0), .offset = 0 } }, .allocator = allocator };
             }
         },
         else => {
@@ -670,6 +680,10 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, state: *Se
             // TODO respond correctly
             return .{ .simple_string = .{ .value = "OK" } };
         },
+        .psync => {
+            // TODO respond correctly
+            return .{ .simple_string = .{ .value = "DOESNTMATTER" } };
+        },
     }
     return error.UnimplementedError;
 }
@@ -749,6 +763,18 @@ pub fn sendSyncHandshakeToMaster(allocator: std.mem.Allocator, state: *ServerSta
                 .simple_string => |s| if (!std.ascii.eqlIgnoreCase(s.value, "OK")) return Error.FailedSyncHandshake,
                 else => return Error.FailedSyncHandshake,
             }
+        }
+        {
+            // Send PSYNC: PSYNC ? -1
+            const msgs = [_]Message{ .{ .bulk_string = .{ .value = "PSYNC" } }, .{ .bulk_string = .{ .value = "?" } }, .{ .bulk_string = .{ .value = "-1" } } };
+            const psync = Message{ .array = .{ .elements = &msgs } };
+            try master_stream.writeAll(try psync.toStr(allocator));
+            // Expect OK.
+            var response_buffer = std.ArrayList(u8).init(allocator);
+            defer response_buffer.deinit();
+            const num_read_bytes = try network.readFromStream(master_stream, &response_buffer);
+            if (num_read_bytes == 0) return Error.FailedSyncHandshake;
+            // TODO ignore the response for now, handle later.
         }
     }
 
