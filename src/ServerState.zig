@@ -9,6 +9,7 @@ allocator: std.mem.Allocator,
 /// Make sure to hold this lock whenever accessing any other writeable fields. Prefer using thread-safe getters and setters.
 rwLock: RwLock,
 /// This field must only be accessed when `rwLock` is held.
+/// This field should contain all the data needed when replying to INFO commands.
 info_sections: InfoSections,
 /// This field must only be accessed when `rwLock` is held.
 cache: Cache,
@@ -68,7 +69,7 @@ const ReplicationInfoSection = struct {
     master_replid: ?[40]u8,
     master_repl_offset: u64,
 };
-pub const InfoSections = struct {
+const InfoSections = struct {
     replication: ReplicationInfoSection,
 };
 

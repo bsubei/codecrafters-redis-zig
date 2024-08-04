@@ -586,7 +586,7 @@ pub fn handleRequest(request: Request, state: *ServerState) !void {
             try state.cachePutWithExpiryThreadSafe(s.key, s.value, s.expiry);
         },
         .replconf => {
-            // TODO handle replconf (need to register new replica if I'm a master).
+            // TODO handle replconf (need to register new replica if I'm a master). Need to also keep track of what stage of registration each replica is at.
         },
         else => {},
     }
@@ -662,7 +662,7 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, state: *Se
             for (i.arguments) |section_key| {
                 // TODO for now we just ignore unknown section keys.
                 // Find the section in InfoSections that matches the section_key (e.g. "replication").
-                inline for (@typeInfo(ServerState.InfoSections).Struct.fields) |section| {
+                inline for (@typeInfo(@TypeOf(state.info_sections)).Struct.fields) |section| {
                     if (std.ascii.eqlIgnoreCase(section.name, section_key)) {
                         // Now, take that config section (e.g. ReplicationConfig) and concatenate all its fields as name:value strings.
                         const config_section = @field(state.getInfoSectionsThreadSafe(), section.name);
