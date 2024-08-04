@@ -1,21 +1,52 @@
 //! This struct holds all the server state, including the config, information about replicas/master, and the cache date (key-value store with expiry).
+//! Most of its members should only be accessed when `rwLock` is held, to allow for thread-safe reads and writes. Prefer using thread-safe getters and setters.
 
 const std = @import("std");
-const Cache = @import("RwLockHashMap.zig");
+const Cache = @import("Cache.zig");
+const RwLock = std.Thread.RwLock;
 
-// TODO need to hide all access behind a read-write lock.
 allocator: std.mem.Allocator,
+/// Make sure to hold this lock whenever accessing any other writeable fields. Prefer using thread-safe getters and setters.
+rwLock: RwLock,
+/// This field must only be accessed when `rwLock` is held.
 info_sections: InfoSections,
-port: u16,
-replicaof: ?ReplicaOf,
+/// This field must only be accessed when `rwLock` is held.
 cache: Cache,
+// TODO figure out how to make these const.
+/// This field is safe to access without holding `rwLock`, since it's not supposed to mutate.
+port: u16,
+/// This field is safe to access without holding `rwLock`, since it's not supposed to mutate.
+replicaof: ?ReplicaOf,
 
+const Self = @This();
 const DEFAULT_PORT = 6379;
 const Error = error{
     BadCLIArgument,
 };
 
-const Self = @This();
+/// Even though the returned value contains slices of bytes, because the bytes are const, making copies
+/// of the slices is enough to make this thread-safe.
+pub fn getInfoSectionsThreadSafe(self: *Self) InfoSections {
+    self.rwLock.lockShared();
+    defer self.rwLock.unlockShared();
+    return self.info_sections;
+}
+pub fn cacheGetThreadSafe(self: *Self, key: Cache.K) ?Cache.V {
+    self.rwLock.lockShared();
+    defer self.rwLock.unlockShared();
+    return self.cache.get(key);
+}
+pub fn cachePutThreadSafe(self: *Self, key: Cache.K, value: Cache.V) !void {
+    self.rwLock.lock();
+    defer self.rwLock.unlock();
+    return self.cache.put(key, value);
+}
+pub fn cachePutWithExpiryThreadSafe(self: *Self, key: Cache.K, value: Cache.V, expiry: Cache.ExpiryTimestampMs) !void {
+    self.rwLock.lock();
+    defer self.rwLock.unlock();
+    return self.cache.putWithExpiry(key, value, expiry);
+}
+
 pub fn deinit(self: *Self) void {
     if (self.replicaof) |replicaof| {
         self.allocator.free(replicaof.master_host);
@@ -73,7 +104,14 @@ pub fn initFromCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !
 
     const infos = try createInfoSections(replicaof);
     const cache = Cache.init(allocator);
-    return Self{ .allocator = allocator, .info_sections = infos, .port = if (port) |p| p else DEFAULT_PORT, .replicaof = replicaof, .cache = cache };
+    return Self{
+        .allocator = allocator,
+        .rwLock = RwLock{},
+        .info_sections = infos,
+        .port = if (port) |p| p else DEFAULT_PORT,
+        .replicaof = replicaof,
+        .cache = cache,
+    };
 }
 
 /// This doesn't need to be cryptographically secure, we just need fast pseudo-random numbers.

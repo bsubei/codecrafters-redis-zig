@@ -5,7 +5,7 @@
 const std = @import("std");
 const net = std.net;
 const stdout = std.io.getStdOut().writer();
-const Cache = @import("RwLockHashMap.zig");
+const Cache = @import("Cache.zig");
 const ServerState = @import("ServerState.zig");
 const testing = std.testing;
 const string_utils = @import("string_utils.zig");
@@ -569,7 +569,7 @@ pub fn handleRequest(request: Request, state: *ServerState) !void {
     // We only need to update state for SET commands. Everything else is ignored here.
     switch (request.command) {
         .set => |s| {
-            try state.cache.putWithExpiry(s.key, s.value, s.expiry);
+            try state.cachePutWithExpiryThreadSafe(s.key, s.value, s.expiry);
         },
         .replconf => {
             // TODO handle replconf (need to register new replica if I'm a master).
@@ -601,7 +601,7 @@ test "handleRequest SetCommand" {
         const request = Request{ .allocator = undefined, .command = Command{ .set = SetCommand{ .key = "key1", .value = "value1", .expiry = null } } };
         try handleRequest(request, &state);
         try testing.expectEqual(1, state.cache.count());
-        try testing.expectEqualSlices(u8, "value1", state.cache.get("key1").?);
+        try testing.expectEqualSlices(u8, "value1", state.cacheGetThreadSafe("key1").?);
     }
     {
         // NOTE: even though it's usually a bad idea to write unit tests that depend on timing, this should be fine since we're putting in
@@ -611,7 +611,7 @@ test "handleRequest SetCommand" {
         // Replacing the same key with a new value should result in the same count.
         try testing.expectEqual(1, state.cache.count());
         // The value should be expired.
-        try testing.expectEqual(null, state.cache.get("key1"));
+        try testing.expectEqual(null, state.cacheGetThreadSafe("key1"));
     }
 }
 
@@ -627,7 +627,7 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, state: *Se
             return .{ .bulk_string = .{ .value = e.contents } };
         },
         .get => |g| {
-            const value = state.cache.get(g.key);
+            const value = state.cacheGetThreadSafe(g.key);
             if (value) |v| {
                 return .{ .bulk_string = .{ .value = v } };
             }
@@ -651,7 +651,7 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, state: *Se
                 inline for (@typeInfo(ServerState.InfoSections).Struct.fields) |section| {
                     if (std.ascii.eqlIgnoreCase(section.name, section_key)) {
                         // Now, take that config section (e.g. ReplicationConfig) and concatenate all its fields as name:value strings.
-                        const config_section = @field(state.info_sections, section.name);
+                        const config_section = @field(state.getInfoSectionsThreadSafe(), section.name);
                         inline for (@typeInfo(@TypeOf(config_section)).Struct.fields) |section_field| {
                             const field_value = @field(config_section, section_field.name);
                             concatenated = try string_utils.appendNameValue(allocator, section_field.type, section_field.name, field_value, concatenated);

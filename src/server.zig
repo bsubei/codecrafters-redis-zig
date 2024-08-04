@@ -2,7 +2,7 @@ const std = @import("std");
 const net = std.net;
 const stdout = std.io.getStdOut().writer();
 const testing = std.testing;
-const Cache = @import("RwLockHashMap.zig");
+const Cache = @import("Cache.zig");
 const parser = @import("parser.zig");
 const ServerState = @import("ServerState.zig");
 const network = @import("network.zig");
@@ -12,7 +12,7 @@ const Error = error{
 };
 
 pub fn runServer(state: *ServerState) !void {
-    switch (state.info_sections.replication.role) {
+    switch (state.getInfoSectionsThreadSafe().replication.role) {
         .master => {
             try runMasterServer(state);
         },
@@ -164,7 +164,6 @@ pub fn runMasterServer(state: *ServerState) !void {
     const our_address = try net.Address.resolveIp("127.0.0.1", state.port);
     try listenForClientsAndHandleRequests(our_address, state);
 }
-// TODO combine configs, cli args, and cache into one struct. Hide everything in there behind a read-write lock.
 pub fn runSlaveServer(state: *ServerState) !void {
     const our_address = try net.Address.resolveIp("127.0.0.1", state.port);
 
