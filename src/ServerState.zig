@@ -2,8 +2,16 @@
 //! Most of its members should only be accessed when `rwLock` is held, to allow for thread-safe reads and writes. Prefer using thread-safe getters and setters.
 
 const std = @import("std");
+const net = std.net;
 const Cache = @import("Cache.zig");
 const RwLock = std.Thread.RwLock;
+const posix = std.posix;
+
+const Self = @This();
+const PortType = u16;
+// TODO double check that Addresses can be auto hashed.
+const ReplicaMap = std.HashMap(net.Address, ReplicaState, AddressContext, std.hash_map.default_max_load_percentage);
+const DEFAULT_PORT = 6379;
 
 allocator: std.mem.Allocator,
 /// Make sure to hold this lock whenever accessing any other writeable fields. Prefer using thread-safe getters and setters.
@@ -13,14 +21,15 @@ rwLock: RwLock,
 info_sections: InfoSections,
 /// This field must only be accessed when `rwLock` is held.
 cache: Cache,
+/// This field must only be accessed when `rwLock` is held.
+/// This hashmap contains all of our replicas keyed by their address.
+replicaStatesByAddress: ReplicaMap,
 // TODO figure out how to make these const.
 /// This field is safe to access without holding `rwLock`, since it's not supposed to mutate.
-port: u16,
+port: PortType,
 /// This field is safe to access without holding `rwLock`, since it's not supposed to mutate.
 replicaof: ?ReplicaOf,
 
-const Self = @This();
-const DEFAULT_PORT = 6379;
 const Error = error{
     BadCLIArgument,
 };
@@ -47,12 +56,23 @@ pub fn cachePutWithExpiryThreadSafe(self: *Self, key: Cache.K, value: Cache.V, e
     defer self.rwLock.unlock();
     return self.cache.putWithExpiry(key, value, expiry);
 }
+pub fn replicaStatesGetThreadSafe(self: *Self, key: net.Address) ?ReplicaState {
+    self.rwLock.lockShared();
+    defer self.rwLock.unlockShared();
+    return self.replicaStatesByAddress.get(key);
+}
+pub fn replicaStatesPutThreadSafe(self: *Self, key: net.Address, value: ReplicaState) !void {
+    self.rwLock.lock();
+    defer self.rwLock.unlock();
+    return self.replicaStatesByAddress.put(key, value);
+}
 
 pub fn deinit(self: *Self) void {
     if (self.replicaof) |replicaof| {
         self.allocator.free(replicaof.master_host);
     }
     self.cache.deinit();
+    self.replicaStatesByAddress.deinit();
 }
 
 const ReplicaOf = struct {
@@ -67,10 +87,42 @@ const ServerRole = enum {
 const ReplicationInfoSection = struct {
     role: ServerRole,
     master_replid: ?[40]u8,
-    master_repl_offset: u64,
+    master_repl_offset: i64,
 };
 const InfoSections = struct {
     replication: ReplicationInfoSection,
+};
+
+pub const ReplconfCapability = enum {
+    psync2,
+};
+
+const InitialPing = struct {};
+const FirstReplconf = struct { port: u16 };
+const SecondReplconf = struct { port: u16, capa: ReplconfCapability };
+const ReceivingSync = struct { port: u16, capa: ReplconfCapability };
+const ConnectedReplica = struct { port: u16, capa: ReplconfCapability };
+const ReplicaStateType = enum {
+    initial_ping,
+    first_replconf,
+    second_replconf,
+    receiving_sync,
+    connected_replica,
+};
+/// A replica performs a handshake with the master server by going through these states:
+/// InitialPing <-- after a replica sends a PING to the master.
+/// FirstReplconf <-- after a replica sends the first "REPLCONF listening-port <port>" command to the master.
+/// SecondReplconf <-- after a replica sends "REPLCONF capa psync2" or a similar command to the master.
+/// ConnectedReplica <-- after a replica sends "PSYNC ? -1" to the master, the master replies with "+FULLRESYNC <replid> 0",
+///     and immediately sends an RDB file to the replica. At this point, this replica is considered fully connected and the master
+///     will relay write commends to it.
+/// TODO define ReceivingSync as the interim period in between the master replying with +FULLRESYNC and sending the RDB file.
+pub const ReplicaState = union(ReplicaStateType) {
+    initial_ping: InitialPing,
+    first_replconf: FirstReplconf,
+    second_replconf: SecondReplconf,
+    receiving_sync: ReceivingSync,
+    connected_replica: ConnectedReplica,
 };
 
 // TODO refactor this to make it testable and write tests.
@@ -112,6 +164,7 @@ pub fn initFromCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !
         .port = if (port) |p| p else DEFAULT_PORT,
         .replicaof = replicaof,
         .cache = cache,
+        .replicaStatesByAddress = ReplicaMap.init(allocator),
     };
 }
 
@@ -137,3 +190,54 @@ fn createInfoSections(replicaof: ?ReplicaOf) !InfoSections {
 }
 
 // TODO test createConfig
+
+pub const AddressContext = struct {
+    pub fn hash(_: @This(), address: net.Address) u64 {
+        switch (address.any.family) {
+            posix.AF.INET => {
+                const ip4 = address.in;
+                return @as(u64, ip4.sa.port) << 32 | ip4.sa.addr;
+            },
+            posix.AF.INET6 => {
+                const ip6 = address.in6;
+                var hasher = std.hash.Wyhash.init(0);
+                std.hash.autoHash(&hasher, ip6.sa.addr);
+                std.hash.autoHash(&hasher, ip6.sa.port);
+                std.hash.autoHash(&hasher, ip6.sa.flowinfo);
+                std.hash.autoHash(&hasher, ip6.sa.scope_id);
+                return hasher.final();
+            },
+            posix.AF.UNIX => {
+                if (!@hasField(std.net.Address, "un")) {
+                    @compileError("Unix sockets are not supported on this platform");
+                }
+                var hasher = std.hash.Wyhash.init(0);
+                std.hash.autoHash(&hasher, address.un.path);
+                return hasher.final();
+            },
+            else => @panic("Unsupported address family"),
+        }
+    }
+    pub fn eql(_: @This(), a: std.net.Address, b: std.net.Address) bool {
+        if (a.any.family != b.any.family) return false;
+
+        switch (a.any.family) {
+            posix.AF.INET => {
+                return a.in.sa.port == b.in.sa.port and a.in.sa.addr == b.in.sa.addr;
+            },
+            posix.AF.INET6 => {
+                return a.in6.sa.port == b.in6.sa.port and
+                    std.mem.eql(u8, &a.in6.sa.addr, &b.in6.sa.addr) and
+                    a.in6.sa.flowinfo == b.in6.sa.flowinfo and
+                    a.in6.sa.scope_id == b.in6.sa.scope_id;
+            },
+            posix.AF.UNIX => {
+                if (!@hasField(std.net.Address, "un")) {
+                    @compileError("Unix sockets are not supported on this platform");
+                }
+                return std.mem.eql(u8, &a.un.path, &b.un.path);
+            },
+            else => @panic("Unsupported address family"),
+        }
+    }
+};

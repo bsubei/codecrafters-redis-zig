@@ -49,3 +49,4 @@ Refactored parser to be cleaner:
 - It turns out I didn't do a good job of setting up the data modeling for the server state.
 - I put all the server state behind one struct. Now I need to move the mutex locking from being just in the hashmap to the rest of the server state (because that can also change).
 - I think I'm getting the hang of idiomatic Zig. It's a bit different but I think it ends up being readable because it's predictable.
+- D'oh! I think I made a mistake moving all the server state behind one mutex lock. I should probably have the Cache have its own lock so it's not slowed down by random unrelated requests from replicas (?).

@@ -27,6 +27,10 @@ const Error = error{
     UnimplementedNonArrayRequest,
     FailedSyncHandshake,
     BadConfiguration,
+    UnimplementedRequest,
+    InvalidReplicaState,
+    InvalidPsyncHandshakeArgs,
+    InvalidRequestForReplicaToReceive,
 };
 
 // NOTE: we have to make these into wrapper classes because otherwise these String types would be aliases to []const u8, and then we can't distinguish between the two in the tagged union.
@@ -376,7 +380,7 @@ const SetCommand = struct { key: []const u8, value: []const u8, expiry: Cache.Ex
 const GetCommand = struct { key: []const u8 };
 const InfoCommand = struct { arguments: [][]const u8 };
 const ReplconfCommand = struct { arguments: [][]const u8 };
-const PsyncCommand = struct { replicationid: []const u8, offset: u64 };
+const PsyncCommand = struct { replicationid: []const u8, offset: i64 };
 const CommandType = enum {
     ping,
     echo,
@@ -401,6 +405,7 @@ const Command = union(CommandType) {
 const Request = struct {
     allocator: std.mem.Allocator,
     command: Command,
+    sender_address: std.net.Address,
 
     const Self = @This();
     pub fn deinit(self: *Self) void {
@@ -437,7 +442,7 @@ const Request = struct {
     }
 };
 
-fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
+fn messageToRequest(allocator: std.mem.Allocator, message: Message, sender_address: std.net.Address) !Request {
     switch (message) {
         .array => {
             const messages = message.array.elements;
@@ -448,8 +453,16 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
             // TODO surely I can get a comptime func to match against the first_word here? Or at least just get the name of the enum field
             if (std.ascii.eqlIgnoreCase(first_word, "ping")) {
                 switch (messages.len) {
-                    1 => return .{ .command = .{ .ping = .{ .contents = null } }, .allocator = undefined },
-                    2 => return .{ .command = .{ .ping = .{ .contents = @as(?[]const u8, try allocator.dupe(u8, try messages[1].get_contents())) } }, .allocator = allocator },
+                    1 => return .{
+                        .command = .{ .ping = .{ .contents = null } },
+                        .allocator = undefined,
+                        .sender_address = sender_address,
+                    },
+                    2 => return .{
+                        .command = .{ .ping = .{ .contents = @as(?[]const u8, try allocator.dupe(u8, try messages[1].get_contents())) } },
+                        .allocator = allocator,
+                        .sender_address = sender_address,
+                    },
                     else => {
                         return Error.InvalidRequestNumberOfArgs;
                     },
@@ -457,7 +470,11 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
             }
             if (std.ascii.eqlIgnoreCase(first_word, "echo")) {
                 switch (messages.len) {
-                    2 => return .{ .command = .{ .echo = .{ .contents = try allocator.dupe(u8, try messages[1].get_contents()) } }, .allocator = allocator },
+                    2 => return .{
+                        .command = .{ .echo = .{ .contents = try allocator.dupe(u8, try messages[1].get_contents()) } },
+                        .allocator = allocator,
+                        .sender_address = sender_address,
+                    },
                     else => {
                         return Error.InvalidRequestNumberOfArgs;
                     },
@@ -465,7 +482,11 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
             }
             if (std.ascii.eqlIgnoreCase(first_word, "get")) {
                 switch (messages.len) {
-                    2 => return .{ .command = .{ .get = .{ .key = try allocator.dupe(u8, try messages[1].get_contents()) } }, .allocator = allocator },
+                    2 => return .{
+                        .command = .{ .get = .{ .key = try allocator.dupe(u8, try messages[1].get_contents()) } },
+                        .allocator = allocator,
+                        .sender_address = sender_address,
+                    },
                     else => {
                         return Error.InvalidRequestNumberOfArgs;
                     },
@@ -485,7 +506,7 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
                         else
                             null;
 
-                        return .{ .command = .{ .set = .{ .key = key, .value = value, .expiry = expiry } }, .allocator = allocator };
+                        return .{ .command = .{ .set = .{ .key = key, .value = value, .expiry = expiry } }, .allocator = allocator, .sender_address = sender_address };
                     },
                     else => {
                         return Error.InvalidRequestNumberOfArgs;
@@ -494,23 +515,31 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
             }
             if (std.ascii.eqlIgnoreCase(first_word, "info")) {
                 // TODO we should dedupe any given section keys.
-                // This seems like a bunch of unnecessary allocating, but it's ok since we're using an arena allocator backed by a page allocator.
-                const section_messages = messages[1..];
-                var temp_list = std.ArrayList([]const u8).init(allocator);
-                errdefer temp_list.deinit();
-                for (section_messages) |msg| {
-                    try temp_list.append(try allocator.dupe(u8, try msg.get_contents()));
-                }
-                // We transfer ownership of the arguments within the Request to the caller.
-                return .{ .command = .{ .info = .{ .arguments = try temp_list.toOwnedSlice() } }, .allocator = allocator };
+                // Just copy over all the remaining message contents to the arguments, and pass on ownership to the caller.
+                var list_str = try messagesToArrayList(allocator, messages[1..]);
+                errdefer list_str.deinit();
+                return .{ .command = .{ .info = .{ .arguments = try list_str.toOwnedSlice() } }, .allocator = allocator, .sender_address = sender_address };
             }
-            // TODO finish handling replconf as master server
             if (std.ascii.eqlIgnoreCase(first_word, "replconf")) {
-                return .{ .command = .{ .replconf = .{ .arguments = try allocator.alloc([]const u8, 0) } }, .allocator = allocator };
+                switch (messages.len) {
+                    1 => return Error.InvalidRequestNumberOfArgs,
+                    else => {
+                        // Just copy over all the remaining message contents to the arguments, and pass on ownership to the caller.
+                        var list_str = try messagesToArrayList(allocator, messages[1..]);
+                        errdefer list_str.deinit();
+                        return .{ .command = .{ .replconf = .{ .arguments = try list_str.toOwnedSlice() } }, .allocator = allocator, .sender_address = sender_address };
+                    },
+                }
             }
-            // TODO finish handling psync as master server
             if (std.ascii.eqlIgnoreCase(first_word, "psync")) {
-                return .{ .command = .{ .psync = .{ .replicationid = try allocator.alloc(u8, 0), .offset = 0 } }, .allocator = allocator };
+                switch (messages.len) {
+                    3 => {
+                        const replicationid = try messages[1].get_contents();
+                        const offset = try std.fmt.parseInt(i64, try messages[2].get_contents(), 10);
+                        return .{ .command = .{ .psync = .{ .replicationid = replicationid, .offset = offset } }, .allocator = allocator, .sender_address = sender_address };
+                    },
+                    else => return Error.InvalidRequestNumberOfArgs,
+                }
             }
         },
         else => {
@@ -520,45 +549,56 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
     }
     return Error.InvalidRequest;
 }
+/// Allocates and fills an ArrayList containing a slice/view of the given Messages' contents.
+/// The caller is responsible for calling deinit() on the ArrayList.
+fn messagesToArrayList(allocator: std.mem.Allocator, messages: []const Message) !std.ArrayList([]const u8) {
+    // This seems like a bunch of unnecessary allocating, but it's ok since we're using an arena allocator backed by a page allocator.
+    var temp_list = std.ArrayList([]const u8).init(allocator);
+    errdefer temp_list.deinit();
+    for (messages) |msg| {
+        try temp_list.append(try allocator.dupe(u8, try msg.get_contents()));
+    }
+    return temp_list;
+}
 
 /// Parse and interpret the given raw_message as a Request from a client. The caller owns the Request and is responsible for calling deinit().
-pub fn parseRequest(allocator: std.mem.Allocator, raw_message: []const u8) !Request {
+pub fn parseRequest(allocator: std.mem.Allocator, raw_message: []const u8, sender_address: std.net.Address) !Request {
     // Parse the raw_message into a Message. Make sure to free the message contents when we're done using it.
     var message = try Message.fromStr(allocator, raw_message);
     defer message.deinit();
 
     // Parse the Message into a Request.
-    return messageToRequest(allocator, message);
+    return messageToRequest(allocator, message, sender_address);
 }
 test "parseRequest PingCommand" {
     {
-        var request = try parseRequest(testing.allocator, "*1\r\n$4\r\nPING\r\n");
+        var request = try parseRequest(testing.allocator, "*1\r\n$4\r\nPING\r\n", try std.net.Address.parseIp4("127.0.0.1", 8080));
         defer request.deinit();
         try testing.expect(request.command.ping.contents == null);
     }
     {
-        var request = try parseRequest(testing.allocator, "*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n");
+        var request = try parseRequest(testing.allocator, "*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n", try std.net.Address.parseIp4("127.0.0.1", 8080));
         defer request.deinit();
         try testing.expectEqualSlices(u8, "hello", request.command.ping.contents.?);
     }
 }
 test "parseRequest EchoCommand" {
     {
-        var request = try parseRequest(testing.allocator, "*2\r\n$4\r\nEChO\r\n$3\r\nbye\r\n");
+        var request = try parseRequest(testing.allocator, "*2\r\n$4\r\nEChO\r\n$3\r\nbye\r\n", try std.net.Address.parseIp4("127.0.0.1", 8080));
         defer request.deinit();
         try testing.expectEqualSlices(u8, "bye", request.command.echo.contents);
     }
 }
 test "parseRequest GetCommand" {
     {
-        var request = try parseRequest(testing.allocator, "*2\r\n$3\r\nGet\r\n$3\r\nbye\r\n");
+        var request = try parseRequest(testing.allocator, "*2\r\n$3\r\nGet\r\n$3\r\nbye\r\n", try std.net.Address.parseIp4("127.0.0.1", 8080));
         defer request.deinit();
         try testing.expectEqualSlices(u8, "bye", request.command.get.key);
     }
 }
 test "parseRequest SetCommand" {
     {
-        var request = try parseRequest(testing.allocator, "*3\r\n$3\r\nsEt\r\n$4\r\nfour\r\n$1\r\n4\r\n");
+        var request = try parseRequest(testing.allocator, "*3\r\n$3\r\nsEt\r\n$4\r\nfour\r\n$1\r\n4\r\n", try std.net.Address.parseIp4("127.0.0.1", 8080));
         defer request.deinit();
         try testing.expectEqualSlices(u8, "four", request.command.set.key);
         try testing.expectEqualSlices(u8, "4", request.command.set.value);
@@ -568,7 +608,7 @@ test "parseRequest SetCommand" {
         // We can't predict exactly what expiry timestamp the cache will record (because time will elapse from this moment until we actually put the entry
         // in the hashmap and), but it must at least be 1234 milliseconds after this moment.
         const time_before_request = std.time.milliTimestamp();
-        var request = try parseRequest(testing.allocator, "*5\r\n$3\r\nsEt\r\n$4\r\nfour\r\n$4\r\nFOUR\r\n$2\r\nPx\r\n$4\r\n1234\r\n");
+        var request = try parseRequest(testing.allocator, "*5\r\n$3\r\nsEt\r\n$4\r\nfour\r\n$4\r\nFOUR\r\n$2\r\nPx\r\n$4\r\n1234\r\n", try std.net.Address.parseIp4("127.0.0.1", 8080));
         defer request.deinit();
         try testing.expectEqualSlices(u8, "four", request.command.set.key);
         try testing.expectEqualSlices(u8, "FOUR", request.command.set.value);
@@ -578,61 +618,15 @@ test "parseRequest SetCommand" {
 // TODO test errors for parseRequest
 // TODO test parseRequest for InfoCommand and ReplconfCommand
 
-/// Given a client request, update any server state if needed.
-pub fn handleRequest(request: Request, state: *ServerState) !void {
-    // We only need to update state for SET commands. Everything else is ignored here.
-    switch (request.command) {
-        .set => |s| {
-            try state.cachePutWithExpiryThreadSafe(s.key, s.value, s.expiry);
-        },
-        .replconf => {
-            // TODO handle replconf (need to register new replica if I'm a master). Need to also keep track of what stage of registration each replica is at.
-        },
-        else => {},
-    }
-}
-test "handleRequest no effect" {
-    var state = try ServerState.initFromCliArgs(testing.allocator, &[_][]const u8{});
-    defer state.deinit();
-    try testing.expectEqual(0, state.cache.count());
-    {
-        const request = Request{ .allocator = undefined, .command = .{ .echo = .{ .contents = "can you hear me?" } } };
-        try handleRequest(request, &state);
-        try testing.expectEqual(0, state.cache.count());
-    }
-    {
-        const request = Request{ .allocator = undefined, .command = .{ .get = .{ .key = "does not exist" } } };
-        try handleRequest(request, &state);
-        try testing.expectEqual(0, state.cache.count());
-    }
-}
-test "handleRequest SetCommand" {
-    var state = try ServerState.initFromCliArgs(testing.allocator, &[_][]const u8{});
-    defer state.deinit();
-
-    try testing.expectEqual(0, state.cache.count());
-    {
-        const request = Request{ .allocator = undefined, .command = .{ .set = .{ .key = "key1", .value = "value1", .expiry = null } } };
-        try handleRequest(request, &state);
-        try testing.expectEqual(1, state.cache.count());
-        try testing.expectEqualSlices(u8, "value1", state.cacheGetThreadSafe("key1").?);
-    }
-    {
-        // NOTE: even though it's usually a bad idea to write unit tests that depend on timing, this should be fine since we're putting in
-        // a big negative expiry. It's unlikely that the system clock will jump back by more than 100 days in the past in between calling cache.putWithExpiry() and cache.get().
-        const request = Request{ .allocator = undefined, .command = .{ .set = .{ .key = "key1", .value = "value1000", .expiry = -100 * std.time.ms_per_day } } };
-        try handleRequest(request, &state);
-        // Replacing the same key with a new value should result in the same count.
-        try testing.expectEqual(1, state.cache.count());
-        // The value should be expired.
-        try testing.expectEqual(null, state.cacheGetThreadSafe("key1"));
-    }
-}
-
-fn getResponseMessage(allocator: std.mem.Allocator, request: Request, state: *ServerState) !Message {
+fn handleRequestAndGenerateResponseMessage(allocator: std.mem.Allocator, request: Request, state: *ServerState) !Message {
+    const sender_address = request.sender_address;
     switch (request.command) {
         .ping => |p| {
             if (p.contents) |text| {
+                // Record the requester address as a possible replica. They're in the initial Ping state.
+                if (state.replicaof == null and state.replicaStatesGetThreadSafe(sender_address) == null) {
+                    try state.replicaStatesPutThreadSafe(sender_address, ServerState.ReplicaState{ .initial_ping = .{} });
+                }
                 return .{ .bulk_string = .{ .value = text } };
             }
             return .{ .simple_string = .{ .value = "PONG" } };
@@ -647,7 +641,9 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, state: *Se
             }
             return .{ .bulk_string = .{ .value = "" } };
         },
-        .set => {
+        .set => |s| {
+            // TODO implement propagating writes to any connected replicas.
+            try state.cachePutWithExpiryThreadSafe(s.key, s.value, s.expiry);
             return .{ .simple_string = .{ .value = "OK" } };
         },
         .info => |i| {
@@ -676,27 +672,70 @@ fn getResponseMessage(allocator: std.mem.Allocator, request: Request, state: *Se
             // NOTE: we set the allocator for this Message because we want deinit() to free up the value string.
             return .{ .bulk_string = .{ .value = concatenated, .allocator = allocator } };
         },
-        .replconf => {
-            // TODO respond correctly
-            return .{ .simple_string = .{ .value = "OK" } };
+        .replconf => |r| {
+            if (state.replicaof != null) {
+                return Error.InvalidRequestForReplicaToReceive;
+            }
+            switch (r.arguments.len) {
+                2 => {
+                    // Check that we're in the correct state for this replica and that we should advance to the next. Then return OK.
+                    const replica_state = state.replicaStatesGetThreadSafe(sender_address);
+                    // TODO race conditions? What if we grab the replica_state here, but by the time we
+                    if (replica_state) |r_state| {
+                        switch (r_state) {
+                            // Advance from initial_ping to first_replconf, and record the provided port.
+                            .initial_ping => {
+                                if (std.ascii.eqlIgnoreCase(r.arguments[0], "listening-port")) {
+                                    const port = try std.fmt.parseInt(u16, r.arguments[1], 10);
+                                    try state.replicaStatesPutThreadSafe(sender_address, ServerState.ReplicaState{ .first_replconf = .{ .port = port } });
+                                } else {
+                                    return Error.InvalidPsyncHandshakeArgs;
+                                }
+                            },
+                            // Advance from first_replconf to second_replconf if the args are correct. Don't forget to keep the port from the old state.
+                            .first_replconf => |first| {
+                                const capability = std.meta.stringToEnum(ServerState.ReplconfCapability, r.arguments[1]);
+                                if (std.ascii.eqlIgnoreCase(r.arguments[0], "capa") and capability == ServerState.ReplconfCapability.psync2) {
+                                    try state.replicaStatesPutThreadSafe(sender_address, ServerState.ReplicaState{ .second_replconf = .{ .capa = capability.?, .port = first.port } });
+                                } else {
+                                    return Error.InvalidPsyncHandshakeArgs;
+                                }
+                            },
+                            else => return Error.InvalidReplicaState,
+                        }
+                    } else {
+                        return Error.InvalidReplicaState;
+                    }
+                    // If we didn't error out from any previous check, just respond with OK.
+                    return .{ .simple_string = .{ .value = "OK" } };
+                },
+                else => {},
+            }
         },
-        .psync => {
-            // TODO respond correctly
-            return .{ .simple_string = .{ .value = "DOESNTMATTER" } };
+        .psync => |p| {
+            if (state.replicaof != null) {
+                return Error.InvalidRequestForReplicaToReceive;
+            }
+            if (std.ascii.eqlIgnoreCase(p.replicationid, "?") and p.offset == -1) {
+                const reply = try std.fmt.allocPrint(allocator, "+FULLRESYNC {s} 0", .{state.info_sections.replication.master_replid.?});
+                // TODO also reply with the actual RDB file. But I don't think I can do that here in this function. Also I don't have a replica state to encode this interim period.
+                return .{ .simple_string = .{ .value = reply, .allocator = allocator } };
+            } else {
+                return Error.InvalidPsyncHandshakeArgs;
+            }
         },
     }
-    return error.UnimplementedError;
+    return Error.UnimplementedRequest;
 }
 
 /// Given a Request from a client, return a string message containing the response to send to the client. Caller owns returned string.
-pub fn getResponse(allocator: std.mem.Allocator, request: Request, state: *ServerState) ![]const u8 {
-    var response_message = try getResponseMessage(allocator, request, state);
+pub fn handleRequest(allocator: std.mem.Allocator, request: Request, state: *ServerState) ![]const u8 {
+    var response_message = try handleRequestAndGenerateResponseMessage(allocator, request, state);
     defer response_message.deinit();
-
     return response_message.toStr(allocator);
 }
 
-// TODO test getResponse
+// TODO test handleRequest
 
 pub const RdbFile = struct {};
 
@@ -723,7 +762,7 @@ pub fn sendSyncHandshakeToMaster(allocator: std.mem.Allocator, state: *ServerSta
         }
     }
 
-    // TODO send a REPLCONF to master twice, expecting OK back
+    // Send a REPLCONF to master twice, expecting OK back
     {
         // NOTE: it's fine to put this on the stack since its lifetime is as long as this function.
         var port_buf: [8]u8 = undefined;
@@ -765,6 +804,7 @@ pub fn sendSyncHandshakeToMaster(allocator: std.mem.Allocator, state: *ServerSta
             }
         }
         {
+            // TODO send a PSYNC to master, expecting FULLRESYNC back
             // Send PSYNC: PSYNC ? -1
             const msgs = [_]Message{ .{ .bulk_string = .{ .value = "PSYNC" } }, .{ .bulk_string = .{ .value = "?" } }, .{ .bulk_string = .{ .value = "-1" } } };
             const psync = Message{ .array = .{ .elements = &msgs } };
@@ -777,8 +817,6 @@ pub fn sendSyncHandshakeToMaster(allocator: std.mem.Allocator, state: *ServerSta
             // TODO ignore the response for now, handle later.
         }
     }
-
-    // TODO send a PSYNC to master, expecting FULLRESYNC back
 
     // TODO expect master to send us an RDB file
     return .{};

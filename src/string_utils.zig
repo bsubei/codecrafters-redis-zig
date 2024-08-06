@@ -71,4 +71,6 @@ test "getFormatterString" {
     try testing.expectEqualSlices(u8, "{s}:{?s}\n", getFormatterString(?[100]u8));
     try testing.expectEqualSlices(u8, "{s}:{d}\n", getFormatterString(u64));
     try testing.expectEqualSlices(u8, "{s}:{?d}\n", getFormatterString(?u64));
+    try testing.expectEqualSlices(u8, "{s}:{d}\n", getFormatterString(i64));
+    try testing.expectEqualSlices(u8, "{s}:{?d}\n", getFormatterString(?i64));
 }
