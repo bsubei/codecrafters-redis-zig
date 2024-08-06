@@ -9,7 +9,6 @@ const posix = std.posix;
 
 const Self = @This();
 const PortType = u16;
-// TODO double check that Addresses can be auto hashed.
 const ReplicaMap = std.HashMap(net.Address, ReplicaState, AddressContext, std.hash_map.default_max_load_percentage);
 const DEFAULT_PORT = 6379;
 
@@ -98,10 +97,10 @@ pub const ReplconfCapability = enum {
 };
 
 const InitialPing = struct {};
-const FirstReplconf = struct { port: u16 };
-const SecondReplconf = struct { port: u16, capa: ReplconfCapability };
-const ReceivingSync = struct { port: u16, capa: ReplconfCapability };
-const ConnectedReplica = struct { port: u16, capa: ReplconfCapability };
+const FirstReplconf = struct { listening_port: u16 };
+const SecondReplconf = struct { listening_port: u16, capa: ReplconfCapability };
+const ReceivingSync = struct { listening_port: u16, capa: ReplconfCapability };
+const ConnectedReplica = struct { listening_port: u16, capa: ReplconfCapability };
 const ReplicaStateType = enum {
     initial_ping,
     first_replconf,

@@ -623,11 +623,12 @@ fn handleRequestAndGenerateResponseMessage(allocator: std.mem.Allocator, request
     switch (request.command) {
         .ping => |p| {
             if (p.contents) |text| {
-                // Record the requester address as a possible replica. They're in the initial Ping state.
-                if (state.replicaof == null and state.replicaStatesGetThreadSafe(sender_address) == null) {
-                    try state.replicaStatesPutThreadSafe(sender_address, ServerState.ReplicaState{ .initial_ping = .{} });
-                }
+                // Bulk string PINGs are not part of a handshake.
                 return .{ .bulk_string = .{ .value = text } };
+            }
+            // Record the requester address as a possible replica. They're in the initial Ping state.
+            if (state.replicaof == null and state.replicaStatesGetThreadSafe(sender_address) == null) {
+                try state.replicaStatesPutThreadSafe(sender_address, ServerState.ReplicaState{ .initial_ping = .{} });
             }
             return .{ .simple_string = .{ .value = "PONG" } };
         },
@@ -687,7 +688,7 @@ fn handleRequestAndGenerateResponseMessage(allocator: std.mem.Allocator, request
                             .initial_ping => {
                                 if (std.ascii.eqlIgnoreCase(r.arguments[0], "listening-port")) {
                                     const port = try std.fmt.parseInt(u16, r.arguments[1], 10);
-                                    try state.replicaStatesPutThreadSafe(sender_address, ServerState.ReplicaState{ .first_replconf = .{ .port = port } });
+                                    try state.replicaStatesPutThreadSafe(sender_address, ServerState.ReplicaState{ .first_replconf = .{ .listening_port = port } });
                                 } else {
                                     return Error.InvalidPsyncHandshakeArgs;
                                 }
@@ -696,7 +697,7 @@ fn handleRequestAndGenerateResponseMessage(allocator: std.mem.Allocator, request
                             .first_replconf => |first| {
                                 const capability = std.meta.stringToEnum(ServerState.ReplconfCapability, r.arguments[1]);
                                 if (std.ascii.eqlIgnoreCase(r.arguments[0], "capa") and capability == ServerState.ReplconfCapability.psync2) {
-                                    try state.replicaStatesPutThreadSafe(sender_address, ServerState.ReplicaState{ .second_replconf = .{ .capa = capability.?, .port = first.port } });
+                                    try state.replicaStatesPutThreadSafe(sender_address, ServerState.ReplicaState{ .second_replconf = .{ .capa = capability.?, .listening_port = first.listening_port } });
                                 } else {
                                     return Error.InvalidPsyncHandshakeArgs;
                                 }
