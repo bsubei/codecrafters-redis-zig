@@ -682,6 +682,7 @@ fn handleRequestAndGenerateResponseMessage(allocator: std.mem.Allocator, request
                     // Check that we're in the correct state for this replica and that we should advance to the next. Then return OK.
                     const replica_state = state.replicaStatesGetThreadSafe(sender_address);
                     // TODO race conditions? What if we grab the replica_state here, but by the time we
+                    // TODO this code is a bit too gnarly. Hide all this away in a getNextReplicaState function.
                     if (replica_state) |r_state| {
                         switch (r_state) {
                             // Advance from initial_ping to first_replconf, and record the provided port.
@@ -717,12 +718,22 @@ fn handleRequestAndGenerateResponseMessage(allocator: std.mem.Allocator, request
             if (state.replicaof != null) {
                 return Error.InvalidRequestForReplicaToReceive;
             }
-            if (std.ascii.eqlIgnoreCase(p.replicationid, "?") and p.offset == -1) {
-                const reply = try std.fmt.allocPrint(allocator, "+FULLRESYNC {s} 0", .{state.info_sections.replication.master_replid.?});
-                // TODO also reply with the actual RDB file. But I don't think I can do that here in this function. Also I don't have a replica state to encode this interim period.
-                return .{ .simple_string = .{ .value = reply, .allocator = allocator } };
+            if (state.replicaStatesGetThreadSafe(sender_address)) |r_state| {
+                switch (r_state) {
+                    .second_replconf => |second| {
+                        if (std.ascii.eqlIgnoreCase(p.replicationid, "?") and p.offset == -1) {
+                            const reply = try std.fmt.allocPrint(allocator, "+FULLRESYNC {s} 0", .{state.info_sections.replication.master_replid.?});
+                            // TODO also reply with the actual RDB file. But I don't think I can do that here in this function.
+                            try state.replicaStatesPutThreadSafe(sender_address, ServerState.ReplicaState{ .receiving_sync = .{ .listening_port = second.listening_port, .capa = second.capa } });
+                            return .{ .simple_string = .{ .value = reply, .allocator = allocator } };
+                        } else {
+                            return Error.InvalidPsyncHandshakeArgs;
+                        }
+                    },
+                    else => return Error.InvalidReplicaState,
+                }
             } else {
-                return Error.InvalidPsyncHandshakeArgs;
+                return Error.InvalidReplicaState;
             }
         },
     }

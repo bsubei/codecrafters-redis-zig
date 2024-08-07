@@ -6,6 +6,7 @@ const Cache = @import("Cache.zig");
 const parser = @import("parser.zig");
 const ServerState = @import("ServerState.zig");
 const network = @import("network.zig");
+const rdb = @import("rdb.zig");
 
 const Error = error{};
 
@@ -21,7 +22,6 @@ pub fn runServer(state: *ServerState) !void {
 }
 
 fn handleRequestAndRespond(allocator: std.mem.Allocator, raw_message: []const u8, state: *ServerState, connection: anytype) !void {
-
     // Parse the raw_message into a Request (a command from the client).
     var request = try parser.parseRequest(allocator, raw_message, connection.address);
     defer request.deinit();
@@ -168,20 +168,46 @@ fn handleClient(client_connection: net.Server.Connection, state: *ServerState) !
 
         // Clear the message since the client might send more, but don't actually deallocate so we can reuse this for the next message.
         raw_message.clearRetainingCapacity();
+
+        // TODO just temporarily, send an RDB file if the current client is waiting to receive. Need to find a better place to put this + relaying writes to connected replicas.
+        if (state.replicaof == null) {
+            if (state.replicaStatesGetThreadSafe(client_connection.address)) |replica_state| {
+                switch (replica_state) {
+                    .receiving_sync => {
+                        const rdb_file = try rdb.getEmptyRdb(allocator);
+                        defer allocator.free(rdb_file);
+                        const msg = try std.fmt.allocPrint(allocator, "${d}\r\n{s}", .{ rdb_file.len, rdb_file });
+                        defer allocator.free(msg);
+                        try client_connection.stream.writeAll(msg);
+                    },
+                    else => {},
+                }
+            }
+        }
     }
 }
+fn sendReplicaUpdates(allocator: std.mem.Allocator, state: *ServerState) !void {
+    // For now, just take care of sending the RDB file for all replicas waiting for it.
+    const replicas = try state.getReplicaStatesByTypeThreadSafe(allocator, ServerState.ReplicaStateType.receiving_sync);
+    defer allocator.free(replicas);
+    const rdb_data = try rdb.getEmptyRdb(allocator);
+    defer allocator.free(rdb_data);
+    // TODO write to each replica
 
-fn loadRdbFile(rdb: parser.RdbFile, state: *ServerState) !void {
+    // TODO later, relay all writes to replicas (maybe not here, actually).
+}
+
+fn loadRdbFile(rdb_file: parser.RdbFile, state: *ServerState) !void {
     // TODO take the parsed RDB that master sent and use it to update our state.
-    _ = rdb;
+    _ = rdb_file;
     _ = state;
 }
 fn syncWithMaster(allocator: std.mem.Allocator, state: *ServerState) !void {
     // Send full sync handshake to master
-    const rdb = try parser.sendSyncHandshakeToMaster(allocator, state);
+    const rdb_file = try parser.sendSyncHandshakeToMaster(allocator, state);
 
     // Take the parsed RDB that master sent and use it to update our state.
-    try loadRdbFile(rdb, state);
+    try loadRdbFile(rdb_file, state);
 }
 fn listenForClientsAndHandleRequests(address: net.Address, state: *ServerState) !void {
     // Keep listening to new client connections, and once one comes in, set it up to be handled be a new thread and go back to listening.
@@ -191,6 +217,7 @@ fn listenForClientsAndHandleRequests(address: net.Address, state: *ServerState) 
     defer listener.deinit();
     try stdout.print("Started listening at address: {}\n", .{address.in});
     while (true) {
+
         // TODO we delegate the responsibility of closing the connection to the spawned thread, but technically we could have an error before that happens.
         const connection = try listener.accept();
 
