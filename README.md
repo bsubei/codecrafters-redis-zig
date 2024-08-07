@@ -11,12 +11,52 @@ This is a WIP Zig solution to the ["Build Your Own Redis" Challenge](https://cod
 ## Important
 - [x] redo parser in a more general way, it's extremely hacky right now
 - [x] figure out allocation for parser
+- [ ] a ton of gaps in unit tests, but they're covered by a basic integration test + the redis-tester
+  - [ ] I should beef up the integration tests so we can catch any memory management problems. The redis-tester is great for testing behavior, but doesn't catch leaks.
+  - [ ] eventually improve unit tests, but only where the integration test provides poor coverage (don't spend too much time on this).
 
 
 ## Nice-to-haves
 - [ ] set up the integration tests to use the Zig build system instead of crappy Make.
 - [x] proper unit test discovery in build.zig
-- [ ] a few gaps in unit tests, but they're covered by a basic integration test + the redis-tester so meh
+
+# Notes on Architecture/Design
+
+## Event-loop based
+An outline of this Redis server's control flow:
+- A master server starts running, and sets up an event-loop. It creates a listening socket, and registers with the `accept` event (handled in `acceptCallback`).
+  - From now on, when a client or replica are ready to connect, `acceptCallback` will trigger when the event-loop picks it up.
+  - Multiple connections will be handled in series, because this is all happening on a single thread, but that's ok as long as none of these event handlers block or take too long.
+  - The events described below will be picked up and run by the event-loop main thread.
+- `accept` event: When `acceptCallback` triggers, we record this new client and register a `read` event (handled in `readCallback`). We then rearm our own event, so we continue to accept new incoming connections. End of callback.
+- `read` event: When `readCallback` triggers, we read the bytes, and process them. The processing can go one of many ways:
+  - canceled or errored event: remove the client and return disarming the event.
+  - read: we read some bytes
+    - non-zero number of bytes: parse the bytes, process the command, and register a `write` event to respond (handled in `writeCallback`). Make sure we register responses to both the client and any connected replicas if required. Return disarming the event.
+    - no more bytes, because the connection is closed. Return disarming the event.
+- `write` event: When `writeCallback` triggers, we write the given message to the client/replica connection and return disarming the event.
+
+### Mini-glossary
+TODO:
+- event
+- rearm and disarm
+- client and replica
+
+### Open questions
+- in the `read` event, what if we read bytes but there were actually more on the line? Check if that happens, and handle it.
+- long-lived connections?
+- are the events handled in an arbitrary order?
+
+### Is `readCallback` doing too much? It could potentially block the event loop.
+I currently do arguably a lot of work to process each incoming message when I read it. Specifically:
+  1. I take the read bytes, and I convert them to a "Message" type (to distinguish between simple strings, bulk strings, and arrays)
+  2. then I interpret the Message as a Command (e.g. SET, GET) and that includes validation
+  3. then I process each Command to apply any state updates (e.g. update the data store if it's a SET command) and other things (depends on what features of Redis I implement).
+  4. Then, based on what Command I got, I generate a response "Message"
+  5. Finally, I convert this response "Message" to a string that I can send back to the client
+
+I should profile this under heavy loads and decide whether it's worth breaking this out into "parsing" (1 and 2), "processing" (3), and "responding" (4 and 5). Or find alternative solutions. It'll really depend on how many Redis features I implement.
+
 
 # Work Log
 
@@ -50,3 +90,9 @@ Refactored parser to be cleaner:
 - I put all the server state behind one struct. Now I need to move the mutex locking from being just in the hashmap to the rest of the server state (because that can also change).
 - I think I'm getting the hang of idiomatic Zig. It's a bit different but I think it ends up being readable because it's predictable.
 - D'oh! I think I made a mistake moving all the server state behind one mutex lock. I should probably have the Cache have its own lock so it's not slowed down by random unrelated requests from replicas (?).
+- I just realized spawning a new thread to handle each connection is a terrible idea for many reasons:
+  - because we have to propagate all write commands to all connected replicas (who keep connections alive), we are basically trying to have one thread notify a bunch of other threads.
+  - furthermore, all our data structures (the data store/cache, and the replica states) have to be behind mutex locks, and if we have a lot of replicas to propagate to + a lot of incoming client connections (we expect this to be the case for a master server), this'll put massive pressure on the master server and the locking will become a bottleneck.
+- I have to refactor the main server logic to be event-loop based. Probably using libxev. Differences with this approach:
+  - we can only process incoming client connections in series. But that's fine as long as none of our event callbacks block. We can probably still handle a ton of connections.
+  - this also means that the server becomes single-threaded. So we can get rid of the mutex locks! This'll probably end up scaling better than multi-threaded w/ locks as the number of replicas increases. Plus, as long as the implementation is half-decently efficient, we should mostly be I/O-bound, and that means we're not losing too much by foregoing multi-threaded.
