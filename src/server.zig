@@ -4,16 +4,17 @@ const stdout = std.io.getStdOut().writer();
 const testing = std.testing;
 const Cache = @import("Cache.zig");
 const parser = @import("parser.zig");
-const ServerState = @import("ServerState.zig");
+const ServerState = @import("server_state.zig").ServerState;
 const network = @import("network.zig");
 const rdb = @import("rdb.zig");
 const xev = @import("xev");
 const posix = std.posix;
+const Connection = @import("connection.zig").Connection;
 
 const Error = error{};
 
 pub fn runServer(state: *ServerState) !void {
-    switch (state.getInfoSectionsThreadSafe().replication.role) {
+    switch (state.info_sections.replication.role) {
         .master => {
             try runMasterServer(state);
         },
@@ -156,64 +157,47 @@ fn handleRequestAndRespond(allocator: std.mem.Allocator, raw_message: []const u8
 //     }
 // }
 
-/// Handles incoming connections, which could either be clients or other replicas.
-/// If it's a client, then keep reading and responding (tit-for-tat) until they close the connection.
-/// If it's a replica, wait for them to complete the handshake, then start sending them any write commands to keep them in sync.
-fn handleIncomingConnection(
+/// Accepts incoming connections and sets up a recv event for each.
+fn acceptCallback(
     ud: ?*anyopaque,
-    _: *xev.Loop,
+    loop: *xev.Loop,
     _: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
     const connection_fd: posix.socket_t = result.accept catch unreachable;
     const state = @as(*ServerState, @ptrCast(@alignCast(ud.?)));
+    // TODO need to keep track of these created connections in the ServerState so we deinit them when the connection closes.
+    const connection = Connection.init(state, connection_fd) catch return .rearm;
 
-    // TODO this allocator only makes sense for client connections, not replicas. Fix this eventually or we'll effectively leak on replica connections.
-    // We don't expect each client to use up too much memory, so we use an arena allocator for speed and blow away all the memory at once when we're done.
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    var raw_message = std.ArrayList(u8).init(allocator);
-    defer raw_message.deinit();
+    // Create recv event with this accepted socket and trigger the recvCallback.
+    connection.recv(loop, recvCallback);
+    return .rearm;
+}
 
-    while (true) {
-        const num_read_bytes = network.readFromSocket(connection_fd, &raw_message) catch return .rearm;
-        if (num_read_bytes == 0) return .rearm;
-        handleRequestAndRespond(allocator, raw_message.items, state, connection_fd) catch return .rearm;
+fn recvCallback(
+    ud: ?*anyopaque,
+    _: *xev.Loop,
+    completion: *xev.Completion,
+    result: xev.Result,
+) xev.CallbackAction {
+    const recv = completion.op.recv;
+    const connection = @as(*Connection, @ptrCast(@alignCast(ud.?)));
 
-        // Clear the message since the client might send more, but don't actually deallocate so we can reuse this for the next message.
-        raw_message.clearRetainingCapacity();
-    }
+    std.debug.print("INSIDE recvCallback\n", .{});
 
-    // while (true) {
-    //     const num_read_bytes = try network.readFromStream(&raw_message);
-    //     if (num_read_bytes == 0) return;
-
-    //     try handleRequestAndRespond(allocator, raw_message.items, state);
-
-    //     // Clear the message since the client might send more, but don't actually deallocate so we can reuse this for the next message.
-    //     raw_message.clearRetainingCapacity();
-
-    //     // TODO just temporarily, send an RDB file if the current client is waiting to receive. Need to find a better place to put this + relaying writes to connected replicas.
-    //     if (state.replicaof == null) {
-    //         if (state.replicaStatesGetThreadSafe()) |replica_state| {
-    //             switch (replica_state) {
-    //                 .receiving_sync => {
-    //                     const rdb_file = try rdb.getEmptyRdb(allocator);
-    //                     defer allocator.free(rdb_file);
-    //                     const msg = try std.fmt.allocPrint(allocator, "${d}\r\n{s}", .{ rdb_file.len, rdb_file });
-    //                     defer allocator.free(msg);
-    //                     // try connection.stream.writeAll(msg);
-    //                 },
-    //                 else => {},
-    //             }
-    //         }
-    //     }
-    // }
+    const read_len = result.recv catch {
+        // conn.close(loop);
+        return .disarm;
+    };
+    std.debug.print("INSIDE recvCallback, read_len: {d}\n", .{read_len});
+    const raw_message = recv.buffer.slice[0..read_len];
+    std.debug.print("INSIDE recvCallback, raw message: {s}\n", .{raw_message});
+    handleRequestAndRespond(connection.server_state.allocator, raw_message, connection.server_state, recv.fd) catch return .disarm;
+    return .disarm;
 }
 fn sendReplicaUpdates(allocator: std.mem.Allocator, state: *ServerState) !void {
     // For now, just take care of sending the RDB file for all replicas waiting for it.
-    const replicas = try state.getReplicaStatesByTypeThreadSafe(allocator, ServerState.ReplicaStateType.receiving_sync);
+    const replicas = try state.getReplicaStatesByType(allocator, ServerState.ReplicaStateType.receiving_sync);
     defer allocator.free(replicas);
     const rdb_data = try rdb.getEmptyRdb(allocator);
     defer allocator.free(rdb_data);
@@ -246,26 +230,15 @@ fn listenForConnections(address: net.Address, state: *ServerState) !void {
 
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
+
     // Create accept event on the listener socket and trigger the acceptCallback.
     var c_accept: xev.Completion = .{
         .op = .{ .accept = .{ .socket = listener.stream.handle } },
         .userdata = state,
-        .callback = handleIncomingConnection,
+        .callback = acceptCallback,
     };
     loop.add(&c_accept);
     try loop.run(.until_done);
-
-    // while (true) {
-
-    //     // TODO we delegate the responsibility of closing the connection to the spawned thread, but technically we could have an error before that happens.
-    //     const connection = try listener.accept();
-    //     try stdout.print("accepted new connection from {}\n", .{connection.address.in.sa.port});
-
-    //     // TODO join on these threads for correctness.
-    //     // TODO handle errors coming back from these threads.
-    //     const t = try std.Thread.spawn(.{}, handleIncomingConnection, .{ connection, state });
-    //     t.detach();
-    // }
 }
 pub fn runMasterServer(state: *ServerState) !void {
     const our_address = try net.Address.resolveIp("127.0.0.1", state.port);

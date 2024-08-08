@@ -6,7 +6,7 @@ const std = @import("std");
 const net = std.net;
 const stdout = std.io.getStdOut().writer();
 const Cache = @import("Cache.zig");
-const ServerState = @import("ServerState.zig");
+const ServerState = @import("server_state.zig").ServerState;
 const testing = std.testing;
 const string_utils = @import("string_utils.zig");
 const network = @import("network.zig");
@@ -540,10 +540,6 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
                     else => return Error.InvalidRequestNumberOfArgs,
                 }
             }
-
-            for (messages) |m| {
-                std.debug.print("MESSAGE: {s}\n", .{try m.get_contents()});
-            }
         },
         else => {
             // TODO think about implementing simple_string or bulk_string as a request.
@@ -632,8 +628,8 @@ fn handleRequestAndGenerateResponseMessage(allocator: std.mem.Allocator, request
                 return .{ .bulk_string = .{ .value = text } };
             }
             // Record the requester address as a possible replica. They're in the initial Ping state.
-            if (state.replicaof == null and state.replicaStatesGetThreadSafe(sender_address) == null) {
-                try state.replicaStatesPutThreadSafe(sender_address, ServerState.ReplicaState{ .initial_ping = .{} });
+            if (state.replicaof == null and state.replicaStatesByAddress.get(sender_address) == null) {
+                try state.replicaStatesByAddress.put(sender_address, ServerState.ReplicaState{ .initial_ping = .{} });
             }
             return .{ .simple_string = .{ .value = "PONG" } };
         },
@@ -641,7 +637,7 @@ fn handleRequestAndGenerateResponseMessage(allocator: std.mem.Allocator, request
             return .{ .bulk_string = .{ .value = e.contents } };
         },
         .get => |g| {
-            const value = state.cacheGetThreadSafe(g.key);
+            const value = state.cache.get(g.key);
             if (value) |v| {
                 return .{ .bulk_string = .{ .value = v } };
             }
@@ -649,7 +645,7 @@ fn handleRequestAndGenerateResponseMessage(allocator: std.mem.Allocator, request
         },
         .set => |s| {
             // TODO implement propagating writes to any connected replicas.
-            try state.cachePutWithExpiryThreadSafe(s.key, s.value, s.expiry);
+            try state.cache.putWithExpiry(s.key, s.value, s.expiry);
             return .{ .simple_string = .{ .value = "OK" } };
         },
         .info => |i| {
@@ -667,7 +663,7 @@ fn handleRequestAndGenerateResponseMessage(allocator: std.mem.Allocator, request
                 inline for (@typeInfo(@TypeOf(state.info_sections)).Struct.fields) |section| {
                     if (std.ascii.eqlIgnoreCase(section.name, section_key)) {
                         // Now, take that config section (e.g. ReplicationConfig) and concatenate all its fields as name:value strings.
-                        const config_section = @field(state.getInfoSectionsThreadSafe(), section.name);
+                        const config_section = @field(state.info_sections, section.name);
                         inline for (@typeInfo(@TypeOf(config_section)).Struct.fields) |section_field| {
                             const field_value = @field(config_section, section_field.name);
                             concatenated = try string_utils.appendNameValue(allocator, section_field.type, section_field.name, field_value, concatenated);
@@ -685,7 +681,7 @@ fn handleRequestAndGenerateResponseMessage(allocator: std.mem.Allocator, request
             switch (r.arguments.len) {
                 2 => {
                     // Check that we're in the correct state for this replica and that we should advance to the next. Then return OK.
-                    const replica_state = state.replicaStatesGetThreadSafe(sender_address);
+                    const replica_state = state.replicaStatesByAddress.get(sender_address);
                     // TODO race conditions? What if we grab the replica_state here, but by the time we
                     // TODO this code is a bit too gnarly. Hide all this away in a getNextReplicaState function.
                     if (replica_state) |r_state| {
@@ -694,7 +690,7 @@ fn handleRequestAndGenerateResponseMessage(allocator: std.mem.Allocator, request
                             .initial_ping => {
                                 if (std.ascii.eqlIgnoreCase(r.arguments[0], "listening-port")) {
                                     const port = try std.fmt.parseInt(u16, r.arguments[1], 10);
-                                    try state.replicaStatesPutThreadSafe(sender_address, ServerState.ReplicaState{ .first_replconf = .{ .listening_port = port } });
+                                    try state.replicaStatesByAddress.put(sender_address, ServerState.ReplicaState{ .first_replconf = .{ .listening_port = port } });
                                 } else {
                                     return Error.InvalidPsyncHandshakeArgs;
                                 }
@@ -703,7 +699,7 @@ fn handleRequestAndGenerateResponseMessage(allocator: std.mem.Allocator, request
                             .first_replconf => |first| {
                                 const capability = std.meta.stringToEnum(ServerState.ReplconfCapability, r.arguments[1]);
                                 if (std.ascii.eqlIgnoreCase(r.arguments[0], "capa") and capability == ServerState.ReplconfCapability.psync2) {
-                                    try state.replicaStatesPutThreadSafe(sender_address, ServerState.ReplicaState{ .second_replconf = .{ .capa = capability.?, .listening_port = first.listening_port } });
+                                    try state.replicaStatesByAddress.put(sender_address, ServerState.ReplicaState{ .second_replconf = .{ .capa = capability.?, .listening_port = first.listening_port } });
                                 } else {
                                     return Error.InvalidPsyncHandshakeArgs;
                                 }
@@ -723,13 +719,13 @@ fn handleRequestAndGenerateResponseMessage(allocator: std.mem.Allocator, request
             if (state.replicaof != null) {
                 return Error.InvalidRequestForReplicaToReceive;
             }
-            if (state.replicaStatesGetThreadSafe(sender_address)) |r_state| {
+            if (state.replicaStatesByAddress.get(sender_address)) |r_state| {
                 switch (r_state) {
                     .second_replconf => |second| {
                         if (std.ascii.eqlIgnoreCase(p.replicationid, "?") and p.offset == -1) {
                             const reply = try std.fmt.allocPrint(allocator, "+FULLRESYNC {s} 0", .{state.info_sections.replication.master_replid.?});
                             // TODO also reply with the actual RDB file. But I don't think I can do that here in this function.
-                            try state.replicaStatesPutThreadSafe(sender_address, ServerState.ReplicaState{ .receiving_sync = .{ .listening_port = second.listening_port, .capa = second.capa } });
+                            try state.replicaStatesByAddress.put(sender_address, ServerState.ReplicaState{ .receiving_sync = .{ .listening_port = second.listening_port, .capa = second.capa } });
                             return .{ .simple_string = .{ .value = reply, .allocator = allocator } };
                         } else {
                             return Error.InvalidPsyncHandshakeArgs;

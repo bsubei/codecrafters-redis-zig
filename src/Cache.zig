@@ -1,5 +1,6 @@
 //! A Hashmap that makes copies of and owns the string keys and string values.
 //! Supports including expiry timestamps, which will filter out any expired values when get() is called.
+//! TODO rename this to RedisStore, Cache is a stupid name
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const stdout = std.io.getStdOut().writer();
