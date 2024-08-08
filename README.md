@@ -4,7 +4,7 @@ This is a WIP Zig solution to the ["Build Your Own Redis" Challenge](https://cod
 # Requirements
 
 - zig 0.12
-- if you want to run the `redis-tester` integration tests, you need `go` and you need to grab the `redis-tester` git submodule: `git submodule update --init --recursive`.
+- Run `git submodule update --init --recursive --remote --force` to get both dependencies checked out to the right commits: `redis-tester` and `libxev`.
 
 # TODOs
 

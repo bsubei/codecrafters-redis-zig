@@ -1,3 +1,7 @@
 [submodule "redis-tester"]
 	path = redis-tester
 	url = https://github.com/codecrafters-io/redis-tester.git
+[submodule "libxev"]
+	path = libxev
+	url = https://github.com/mitchellh/libxev.git
+  branch = zig12
