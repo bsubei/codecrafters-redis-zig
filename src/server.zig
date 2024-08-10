@@ -24,22 +24,6 @@ pub fn runServer(state: *ServerState) !void {
     }
 }
 
-fn handleRequestAndRespond(allocator: std.mem.Allocator, raw_message: []const u8, state: *ServerState, connection_fd: posix.socket_t) !void {
-    // Parse the raw_message into a Request (a command from the client).
-    var request = try parser.parseRequest(allocator, raw_message);
-    defer request.deinit();
-
-    // Handle the Request (update state) and generate a Response as a string.
-    const response_str = try parser.handleRequest(allocator, request, state);
-    defer allocator.free(response_str);
-
-    // Send the Response back to the client.
-    std.debug.print("Writing this to socket: {s}\n", .{response_str});
-    const written_bytes = try network.writeToSocket(connection_fd, response_str);
-    _ = written_bytes;
-    // try connection.stream.writeAll(response_str);
-}
-
 // TODO Fix these tests by wrapping the connection fd in a reader and a writer and passing these into the function. That way we can test it.
 // const MockConnection = struct {
 //     address: std.net.Address,
@@ -164,35 +148,103 @@ fn acceptCallback(
     _: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
+    std.debug.print("acceptCallback\n", .{});
     const connection_fd: posix.socket_t = result.accept catch unreachable;
     const state = @as(*ServerState, @ptrCast(@alignCast(ud.?)));
     // TODO need to keep track of these created connections in the ServerState so we deinit them when the connection closes.
     const connection = Connection.init(state, connection_fd) catch return .rearm;
 
-    // Create recv event with this accepted socket and trigger the recvCallback.
+    // Start reading from this connection forever.
     connection.recv(loop, recvCallback);
+
     return .rearm;
 }
 
+// TODO figure out why the redis-tester is bailing too quickly when trying to get back the response
 fn recvCallback(
     ud: ?*anyopaque,
-    _: *xev.Loop,
+    loop: *xev.Loop,
     completion: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
+    std.debug.print("recvCallback\n", .{});
     const recv = completion.op.recv;
     const connection = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+    const allocator = connection.server_state.allocator;
 
-    std.debug.print("INSIDE recvCallback\n", .{});
-
-    const read_len = result.recv catch {
-        // conn.close(loop);
+    const read_len = result.recv catch |err| {
+        std.debug.print("ERROR reading from socket: {s}\n", .{@errorName(err)});
+        connection.close(loop, closeCallback);
         return .disarm;
     };
-    std.debug.print("INSIDE recvCallback, read_len: {d}\n", .{read_len});
     const raw_message = recv.buffer.slice[0..read_len];
-    std.debug.print("INSIDE recvCallback, raw message: {s}\n", .{raw_message});
-    handleRequestAndRespond(connection.server_state.allocator, raw_message, connection.server_state, recv.fd) catch return .disarm;
+    std.debug.print(
+        "Read from socket {} ({} bytes): {s}\n",
+        .{ recv.fd, read_len, raw_message },
+    );
+
+    // Parse the raw_message into a Request (a command from the client).
+    var request = parser.parseRequest(allocator, raw_message) catch |err| {
+        std.debug.print("ERROR parsing request: {s}\n", .{@errorName(err)});
+        connection.close(loop, closeCallback);
+        return .disarm;
+    };
+    defer request.deinit();
+
+    // Handle the Request (update state) and generate a Response as a string.
+    const response_str = parser.handleRequest(allocator, request, connection.server_state) catch |err| {
+        std.debug.print("ERROR handling request: {s}\n", .{@errorName(err)});
+        connection.close(loop, closeCallback);
+        return .disarm;
+    };
+    // const response_str = "+PONG\r\n";
+    std.debug.print("request -> response:\n{s},{s}\n", .{ raw_message, response_str });
+    defer allocator.free(response_str);
+
+    // Send the Response back to the client by setting up a send event.
+    connection.send(loop, sendCallback, response_str) catch |err| {
+        std.debug.print("ERROR creating a send event: {s}\n", .{@errorName(err)});
+        connection.close(loop, closeCallback);
+        return .disarm;
+    };
+
+    // Don't read anymore for now. Once we process the send event, we set up this recvCallback again.
+    return .disarm;
+}
+fn sendCallback(
+    ud: ?*anyopaque,
+    loop: *xev.Loop,
+    completion: *xev.Completion,
+    result: xev.Result,
+) xev.CallbackAction {
+    std.debug.print("sendCallback\n", .{});
+    const send = completion.op.send;
+    const connection = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+    const send_len = result.send catch |err| {
+        std.debug.print("ERROR sending: {s}\n", .{@errorName(err)});
+        connection.close(loop, closeCallback);
+        return .disarm;
+    };
+
+    std.debug.print("send_len: {d}, buffer len: {d}\n", .{ send_len, send.buffer.slice.len });
+    std.debug.print(
+        "Send to socket {} ({} bytes): {s}\n",
+        .{ send.fd, send_len, send.buffer.slice[0..send_len] },
+    );
+
+    // We're done with sending. However, let's set up recv again in case there's more messages.
+    connection.recv(loop, recvCallback);
+    return .disarm;
+}
+fn closeCallback(
+    ud: ?*anyopaque,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    _: xev.Result,
+) xev.CallbackAction {
+    std.debug.print("closeCallback\n", .{});
+    const connection = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+    connection.deinit();
     return .disarm;
 }
 fn sendReplicaUpdates(allocator: std.mem.Allocator, state: *ServerState) !void {
@@ -224,6 +276,7 @@ fn syncWithMaster(allocator: std.mem.Allocator, state: *ServerState) !void {
 fn listenForConnections(address: net.Address, state: *ServerState) !void {
     var listener = try address.listen(.{
         .reuse_address = true,
+        .kernel_backlog = 128,
     });
     defer listener.deinit();
     try stdout.print("Started listening at address: {}\n", .{address.in});
@@ -232,12 +285,13 @@ fn listenForConnections(address: net.Address, state: *ServerState) !void {
     defer loop.deinit();
 
     // Create accept event on the listener socket and trigger the acceptCallback.
-    var c_accept: xev.Completion = .{
+    state.accept_completion = try state.allocator.create(xev.Completion);
+    state.accept_completion.?.* = .{
         .op = .{ .accept = .{ .socket = listener.stream.handle } },
         .userdata = state,
         .callback = acceptCallback,
     };
-    loop.add(&c_accept);
+    loop.add(state.accept_completion.?);
     try loop.run(.until_done);
 }
 pub fn runMasterServer(state: *ServerState) !void {

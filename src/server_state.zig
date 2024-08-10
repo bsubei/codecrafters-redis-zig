@@ -7,6 +7,7 @@ const Cache = @import("Cache.zig");
 const RwLock = std.Thread.RwLock;
 const posix = std.posix;
 const socket_T = posix.socket_t;
+const xev = @import("xev");
 
 pub const ServerState = struct {
     const Self = @This();
@@ -23,6 +24,8 @@ pub const ServerState = struct {
     /// This hashmap contains all of our replicas keyed by their address.
     replicaStatesByAddress: ReplicaMap,
 
+    accept_completion: ?*xev.Completion = null,
+
     port: PortType,
     replicaof: ?ReplicaOf,
 
@@ -36,6 +39,9 @@ pub const ServerState = struct {
         }
         self.cache.deinit();
         self.replicaStatesByAddress.deinit();
+        if (self.accept_completion) |comp| {
+            self.allocator.destroy(comp);
+        }
     }
 
     const ReplicaOf = struct {
