@@ -4,14 +4,14 @@ This is a WIP Zig solution to the ["Build Your Own Redis" Challenge](https://cod
 # Requirements
 
 - zig 0.12
-- Run `git submodule update --init --recursive --remote --force` to get both dependencies checked out to the right commits: `redis-tester` and `libxev`.
+- Run `git submodule update --init --recursive --remote --force` to get the `libxev` dependency checked out to the right commit.
 
 # TODOs
 
 ## Important
 - [x] redo parser in a more general way, it's extremely hacky right now
 - [x] figure out allocation for parser
-- [ ] a ton of gaps in unit tests, but they're covered by a basic integration test + the redis-tester
+- [ ] a ton of gaps in unit tests, but they're covered by a basic integration test + the codecrafters redis-tester
   - [ ] I should beef up the integration tests so we can catch any memory management problems. The redis-tester is great for testing behavior, but doesn't catch leaks.
   - [ ] eventually improve unit tests, but only where the integration test provides poor coverage (don't spend too much time on this).
 
