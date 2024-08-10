@@ -43,8 +43,11 @@
         //    // actually used.
         //    .lazy = false,
         //},
+
         .libxev = .{
-            .path = "./libxev/",
+            // This URL points to the HEAD commit on the "zig12" branch (as of Aug 10 2024). I can't use HEAD of master because my project is stuck on Zig 0.12.
+            .url = "https://github.com/mitchellh/libxev/archive/efde8a170836334901ed2d59c98bf832eb48ae3a.tar.gz",
+            .hash = "1220bf10f4fc109ca0b50520075e2e730900956e220adee616a01f3f91bc8a802695",
         },
     },
 

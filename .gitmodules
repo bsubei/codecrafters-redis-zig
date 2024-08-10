@@ -1,4 +1,0 @@
-[submodule "libxev"]
-	path = libxev
-	url = https://github.com/mitchellh/libxev.git
-  branch = zig12
