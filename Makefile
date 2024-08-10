@@ -1,6 +1,5 @@
 build_redis_tester:
-	cd $(shell pwd)/redis-tester
-	make build
+	$(MAKE) -C redis-tester build
 
 build:
 	zig build
