@@ -17,7 +17,6 @@ This is a WIP Zig solution to the ["Build Your Own Redis" Challenge](https://cod
 
 
 ## Nice-to-haves
-- [ ] set up the integration tests to use the Zig build system instead of crappy Make.
 - [x] proper unit test discovery in build.zig
 
 # Notes on Architecture/Design
@@ -25,29 +24,25 @@ This is a WIP Zig solution to the ["Build Your Own Redis" Challenge](https://cod
 ## Event-loop based
 An outline of this Redis server's control flow:
 - A master server starts running, and sets up an event-loop. It creates a listening socket, and registers with the `accept` event (handled in `acceptCallback`).
-  - From now on, when a client or replica are ready to connect, `acceptCallback` will trigger when the event-loop picks it up.
+  - From now on, when a client or replica are ready to connect, `acceptCallback` will trigger when the event-loop picks up that event.
   - Multiple connections will be handled in series, because this is all happening on a single thread, but that's ok as long as none of these event handlers block or take too long.
   - The events described below will be picked up and run by the event-loop main thread.
-- `accept` event: When `acceptCallback` triggers, we record this new client and register a `read` event (handled in `readCallback`). We then rearm our own event, so we continue to accept new incoming connections. End of callback.
-- `read` event: When `readCallback` triggers, we read the bytes, and process them. The processing can go one of many ways:
-  - canceled or errored event: remove the client and return disarming the event.
-  - read: we read some bytes
-    - non-zero number of bytes: parse the bytes, process the command, and register a `write` event to respond (handled in `writeCallback`). Make sure we register responses to both the client and any connected replicas if required. Return disarming the event.
-    - no more bytes, because the connection is closed. Return disarming the event.
-- `write` event: When `writeCallback` triggers, we write the given message to the client/replica connection and return disarming the event.
-
-### Mini-glossary
-TODO:
-- event
-- rearm and disarm
-- client and replica
+- `accept` event: When `acceptCallback` triggers, we record this new client (modeled as a `Connection`) and register a `recv` event (handled in `recvCallback`). We then rearm our own event, so we continue to accept new incoming connections. End of callback.
+- `recv` event: When `recvCallback` triggers:
+  - if we read any bytes: parse the bytes, process the command (update state + generate a response), and register a `send` event to respond (handled in `sendCallback`). Make sure we register responses to both the client and any connected replicas if required. Return, disarming our `recv` event.
+  - no bytes read or some other error: set up a `close` event on this `Connection` and return, disarming our `recv` event.
+- `send` event: When `sendCallback` triggers:
+  - if we wrote any bytes: set up a `recv` event again in case the client has more commands. Return, disarming our `send` event.
+  - we didn't write any bytes: set up a `close` event on this `Connection` and return, disarming our `send` event.
+- TODO at some point, we should support retrying reads and writes (in case of network hiccups, or messages too big to fit in our buffer).
+- `close` event: When `closeCallback` triggers, the socket has already closed, so we just have to deinit the `Connection`.
 
 ### Open questions
-- in the `read` event, what if we read bytes but there were actually more on the line? Check if that happens, and handle it.
+- in the `recv` event, what if we read bytes but there were actually more on the line? Check if that happens, and handle it.
 - long-lived connections?
 - are the events handled in an arbitrary order?
 
-### Is `readCallback` doing too much? It could potentially block the event loop.
+### Is `recvCallback` doing too much? It could potentially block the event loop.
 I currently do arguably a lot of work to process each incoming message when I read it. Specifically:
   1. I take the read bytes, and I convert them to a "Message" type (to distinguish between simple strings, bulk strings, and arrays)
   2. then I interpret the Message as a Command (e.g. SET, GET) and that includes validation
@@ -96,3 +91,4 @@ Refactored parser to be cleaner:
 - I have to refactor the main server logic to be event-loop based. Probably using libxev. Differences with this approach:
   - we can only process incoming client connections in series. But that's fine as long as none of our event callbacks block. We can probably still handle a ton of connections.
   - this also means that the server becomes single-threaded. So we can get rid of the mutex locks! This'll probably end up scaling better than multi-threaded w/ locks as the number of replicas increases. Plus, as long as the implementation is half-decently efficient, we should mostly be I/O-bound, and that means we're not losing too much by foregoing multi-threaded.
+- Mostly finished the event-loop refactor. Everything works, except the handshake parts which still need refactoring to be event-based.
