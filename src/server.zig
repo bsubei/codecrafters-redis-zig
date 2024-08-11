@@ -151,12 +151,17 @@ fn acceptCallback(
     std.debug.print("acceptCallback\n", .{});
     const connection_fd: posix.socket_t = result.accept catch unreachable;
     const state = @as(*ServerState, @ptrCast(@alignCast(ud.?)));
-    // TODO need to keep track of these created connections in the ServerState so we deinit them when the connection closes.
-    const connection = Connection.init(state, connection_fd) catch return .rearm;
+    const connection = Connection.init(state, connection_fd) catch |err| {
+        std.debug.print("ERROR creating connection for socket {d}: {s}\n", .{ connection_fd, @errorName(err) });
+        return .rearm;
+    };
+    state.connectionsMap.put(connection_fd, connection) catch |err| {
+        std.debug.print("ERROR putting connectionsMap for socket {d}: {s}\n", .{ connection_fd, @errorName(err) });
+        return .rearm;
+    };
 
-    // Start reading from this connection forever.
+    // Start reading from this connection and listen for more connections.
     connection.recv(loop, recvCallback);
-
     return .rearm;
 }
 
@@ -174,21 +179,21 @@ fn recvCallback(
 
     const read_len = result.recv catch |err| {
         switch (err) {
-            error.EOF => std.debug.print("socket closed from client side: {}\n", .{connection.socket_fd}),
-            else => std.debug.print("ERROR reading from socket: {s}\n", .{@errorName(err)}),
+            error.EOF => std.debug.print("socket closed from client side: {d}\n", .{connection.socket_fd}),
+            else => std.debug.print("ERROR reading from socket {d}: {s}\n", .{ connection.socket_fd, @errorName(err) }),
         }
         connection.close(loop, closeCallback);
         return .disarm;
     };
     const raw_message = recv.buffer.slice[0..read_len];
     std.debug.print(
-        "Read from socket {} ({} bytes): {s}\n",
+        "Read from socket {d} ({d} bytes): {s}\n",
         .{ recv.fd, read_len, raw_message },
     );
 
     // Parse the raw_message into a Request (a command from the client).
     var request = parser.parseRequest(allocator, raw_message) catch |err| {
-        std.debug.print("ERROR parsing request: {s}\n", .{@errorName(err)});
+        std.debug.print("ERROR parsing request from socket {d}: {s}\n", .{ connection.socket_fd, @errorName(err) });
         connection.close(loop, closeCallback);
         return .disarm;
     };
@@ -196,26 +201,46 @@ fn recvCallback(
 
     // Handle the Request (update state) and generate a Response as a string.
     const response_str = parser.handleRequest(allocator, request, connection) catch |err| {
-        std.debug.print("ERROR handling request: {s}\n", .{@errorName(err)});
+        std.debug.print("ERROR handling request from socket {d}: {s}\n", .{ connection.socket_fd, @errorName(err) });
         connection.close(loop, closeCallback);
         return .disarm;
     };
     std.debug.print("request -> response:\n{s},{s}\n", .{ raw_message, response_str });
     defer allocator.free(response_str);
 
-    // TODO if we're a replica, don't set up a send if the sender is master.
+    // If we're a replica, don't set up a send if the sender is master. And just keep listening.
+    const role = connection.server_state.info_sections.replication.role;
+    const replicaof = connection.server_state.replicaof;
+    if (role == .slave and replicaof != null and network.socketMatchesAddressAndPort(connection.socket_fd, replicaof.?.master_host, replicaof.?.master_port) catch false == true) {
+        // Because we're a replica, we should keep listening but not respond to master.
+        return .rearm;
+    } else {
+        // Otherwise, reply as usual.
+        // Send the Response back to the client by setting up a send event.
+        connection.send(loop, sendCallback, response_str) catch |err| {
+            std.debug.print("ERROR creating a send event: {s}\n", .{@errorName(err)});
+            connection.close(loop, closeCallback);
+            return .disarm;
+        };
 
-    // TODO if we're master, set up a send event for replicas (if this is a write command)
+        // If we're master, relay write commands to the replicas, too.
+        switch (request.command) {
+            .set => {
+                if (connection.server_state.getReplicaConnectionsByType(allocator, .connected_replica)) |connection_ptrs| {
+                    defer allocator.free(connection_ptrs);
+                    for (connection_ptrs) |replica_connection| {
+                        replica_connection.send(loop, sendCallback, raw_message) catch |err| {
+                            std.debug.print("ERROR relaying a send event to replica {d}: {s}\n", .{ replica_connection.socket_fd, @errorName(err) });
+                        };
+                    }
+                } else |_| {}
+            },
+            else => {},
+        }
 
-    // Send the Response back to the client by setting up a send event.
-    connection.send(loop, sendCallback, response_str) catch |err| {
-        std.debug.print("ERROR creating a send event: {s}\n", .{@errorName(err)});
-        connection.close(loop, closeCallback);
+        // Because we're a master, we're sending something and shouldn't recv until that's done.
         return .disarm;
-    };
-
-    // Don't read anymore for now. Once we process the send event, we set up this recvCallback again.
-    return .disarm;
+    }
 }
 fn sendCallback(
     ud: ?*anyopaque,
@@ -238,11 +263,12 @@ fn sendCallback(
         .{ send.fd, send_len, send.buffer.slice[0..send_len] },
     );
 
+    // TODO this full sync process is blocking and slow. Shove off the RDB creation to a background thread.
     // If we're master, send the RDB file to conclude the full synchronization if the connection is ready.
     const server_state = connection.server_state;
     const allocator = server_state.allocator;
-    if (connection.server_state.replicaof == null) {
-        if (server_state.replicaStatesByAddress.get(connection.socket_fd)) |replica_state| {
+    if (connection.server_state.info_sections.replication.role == .master) {
+        if (connection.replica_state) |replica_state| {
             switch (replica_state) {
                 .receiving_sync => |r_state| {
                     const rdb_file = rdb.getEmptyRdb(allocator) catch |err| {
@@ -255,10 +281,7 @@ fn sendCallback(
                         return .disarm;
                     };
                     defer allocator.free(msg);
-                    server_state.replicaStatesByAddress.put(connection.socket_fd, .{ .connected_replica = .{ .capa = r_state.capa, .listening_port = r_state.listening_port } }) catch |err| {
-                        std.debug.print("ERROR putting replica state for socket {d}: {s}\n", .{ connection.socket_fd, @errorName(err) });
-                        return .disarm;
-                    };
+                    connection.replica_state = .{ .connected_replica = .{ .capa = r_state.capa, .listening_port = r_state.listening_port } };
                     connection.send(loop, sendCallback, msg) catch |err| {
                         std.debug.print("ERROR creating send event for socket {d}: {s}\n", .{ connection.socket_fd, @errorName(err) });
                         return .disarm;
@@ -282,7 +305,7 @@ fn closeCallback(
 ) xev.CallbackAction {
     std.debug.print("closeCallback\n", .{});
     const connection = @as(*Connection, @ptrCast(@alignCast(ud.?)));
-    connection.deinit();
+    connection.server_state.removeConnection(connection.socket_fd);
     return .disarm;
 }
 

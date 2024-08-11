@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = std.posix;
 const socket_t = posix.socket_t;
 const ServerState = @import("server_state.zig").ServerState;
+const ReplicaState = @import("replica_state.zig").ReplicaState;
 const xev = @import("xev");
 
 /// Make sure a given Connection does not have multiple simultaneous events that it's a part of.
@@ -16,6 +17,9 @@ pub const Connection = struct {
     /// The underlying socket that this Connection object is meant to wrap.
     socket_fd: socket_t,
     completion: xev.Completion,
+
+    /// If this connection represents a replica, this field will contain the state of the replica in relation to our server (implicitly master).
+    replica_state: ?ReplicaState = null,
 
     const Self = @This();
     pub fn init(server_state: *ServerState, socket_fd: socket_t) !*Self {

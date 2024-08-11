@@ -6,13 +6,17 @@ const net = std.net;
 const Cache = @import("Cache.zig");
 const RwLock = std.Thread.RwLock;
 const posix = std.posix;
-const socket_T = posix.socket_t;
+const socket_t = posix.socket_t;
 const xev = @import("xev");
+const Connection = @import("connection.zig").Connection;
+const replica_state = @import("replica_state.zig");
+const ReplicaState = replica_state.ReplicaState;
+const ReplicaStateType = replica_state.ReplicaStateType;
 
 pub const ServerState = struct {
     const Self = @This();
     const PortType = u16;
-    const ReplicaMap = std.AutoHashMap(posix.socket_t, ReplicaState);
+    const ConnectionsMap = std.AutoHashMap(socket_t, *Connection);
     const DEFAULT_PORT = 6379;
 
     allocator: std.mem.Allocator,
@@ -21,8 +25,8 @@ pub const ServerState = struct {
     info_sections: InfoSections,
     /// This hashmap contains the data store for this Redis server.
     cache: Cache,
-    /// This hashmap contains all of our replicas keyed by their address.
-    replicaStatesByAddress: ReplicaMap,
+    /// This hashmap contains pointers to all of our connections keyed by their socket.
+    connectionsMap: ConnectionsMap,
 
     accept_completion: ?*xev.Completion = null,
 
@@ -40,9 +44,15 @@ pub const ServerState = struct {
             self.allocator.free(replicaof.master_host);
         }
         self.cache.deinit();
-        self.replicaStatesByAddress.deinit();
+        self.connectionsMap.deinit();
         if (self.accept_completion) |comp| {
             self.allocator.destroy(comp);
+        }
+    }
+
+    pub fn removeConnection(self: *Self, socket_fd: socket_t) void {
+        if (self.connectionsMap.fetchRemove(socket_fd)) |entry| {
+            entry.value.deinit();
         }
     }
 
@@ -62,44 +72,6 @@ pub const ServerState = struct {
     };
     const InfoSections = struct {
         replication: ReplicationInfoSection,
-    };
-
-    pub const ReplconfCapability = enum {
-        psync2,
-    };
-
-    const InitialPing = struct {};
-    const FirstReplconf = struct { listening_port: u16 };
-    const SecondReplconf = struct { listening_port: u16, capa: ReplconfCapability };
-    const ReceivingSync = struct { listening_port: u16, capa: ReplconfCapability };
-    const ConnectedReplica = struct { listening_port: u16, capa: ReplconfCapability };
-    pub const ReplicaStateType = enum {
-        initial_ping,
-        first_replconf,
-        second_replconf,
-        receiving_sync,
-        connected_replica,
-    };
-    pub fn isReplicaReadyToReceive(replica_state: ReplicaState) bool {
-        switch (replica_state) {
-            .receiving_sync, .connected_replica => true,
-            else => false,
-        }
-    }
-    /// A replica performs a handshake with the master server by going through these states in this order (no skipping!):
-    /// InitialPing <-- after a replica sends a PING to the master.
-    /// FirstReplconf <-- after a replica sends the first "REPLCONF listening-port <port>" command to the master.
-    /// SecondReplconf <-- after a replica sends "REPLCONF capa psync2" or a similar command to the master.
-    /// ReceivingSync <-- after a replica sends "PSYNC ? -1" to the master, the master replies with "+FULLRESYNC <replid> 0". The
-    ///     master should start sending the RDB file now.
-    /// ConnectedReplica <-- Once the RDB file is sent over, the replica is now fully synchronized and connected. The master will relay
-    ///     write commands to it.
-    pub const ReplicaState = union(ReplicaStateType) {
-        initial_ping: InitialPing,
-        first_replconf: FirstReplconf,
-        second_replconf: SecondReplconf,
-        receiving_sync: ReceivingSync,
-        connected_replica: ConnectedReplica,
     };
 
     // TODO refactor this to make it testable and write tests.
@@ -140,7 +112,7 @@ pub const ServerState = struct {
             .port = if (port) |p| p else DEFAULT_PORT,
             .replicaof = replicaof,
             .cache = cache,
-            .replicaStatesByAddress = ReplicaMap.init(allocator),
+            .connectionsMap = ConnectionsMap.init(allocator),
         };
     }
 
@@ -167,16 +139,15 @@ pub const ServerState = struct {
 
     // TODO test createConfig
 
-    /// Returns the ReplicaStates that match the given type.
-    pub fn getReplicaStatesByType(self: *Self, allocator: std.mem.Allocator, replica_type: ReplicaStateType) ![]const ReplicaState {
-        var buf = std.ArrayList(ReplicaState).init(allocator);
+    pub fn getReplicaConnectionsByType(self: *Self, allocator: std.mem.Allocator, replica_type: ReplicaStateType) ![]const *Connection {
+        var buf = std.ArrayList(*Connection).init(allocator);
         errdefer buf.deinit();
 
-        var it = self.replicaStatesByAddress.iterator();
+        var it = self.connectionsMap.iterator();
         while (it.next()) |entry| {
-            if (@as(ReplicaStateType, entry.value_ptr.*) == replica_type) {
-                buf.append(entry.value_ptr.*);
-            }
+            if (entry.value_ptr.*.replica_state) |r_state| if (@as(ReplicaStateType, r_state) == replica_type) {
+                try buf.append(entry.value_ptr.*);
+            };
         }
 
         return buf.toOwnedSlice();

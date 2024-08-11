@@ -50,3 +50,24 @@ pub fn writeToSocket(socket: posix.socket_t, data: []const u8) !void {
     }
     if (total_written > data.len) return error.WroteTooMuch;
 }
+
+pub fn socketMatchesAddressAndPort(socket: posix.socket_t, ip: []const u8, port: u16) !bool {
+    var addr: posix.sockaddr = undefined;
+    var addr_len: posix.socklen_t = @sizeOf(@TypeOf(addr));
+
+    // Get the socket's address information
+    try posix.getsockname(socket, &addr, &addr_len);
+
+    // Use both @alignCast and @ptrCast to handle alignment properly
+    const addr_in: *const posix.sockaddr.in = @ptrCast(@alignCast(&addr));
+
+    // Create an Address from the sockaddr_in
+    // const socket_address = net.Address.initIp4(addr_in.addr, addr_in.port);
+    const socket_address = net.Address.initIp4(@bitCast(addr_in.addr), std.mem.bigToNative(u16, addr_in.port));
+
+    // Create the expected address
+    const expected_address = try net.Address.parseIp(ip, port);
+
+    // Compare the addresses
+    return socket_address.eql(expected_address);
+}
