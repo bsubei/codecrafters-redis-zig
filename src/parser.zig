@@ -757,84 +757,93 @@ pub fn handleRequest(allocator: std.mem.Allocator, request: Request, state: *Ser
 pub const RdbFile = struct {};
 
 // TODO send full sync handshake to master
-// pub fn sendSyncHandshakeToMaster(allocator: std.mem.Allocator, state: *ServerState) !RdbFile {
-//     // Connect to master and ask it to sync. This blocks (does not listen to incoming connections) until finished.
-//     if (state.replicaof == null) return Error.BadConfiguration;
-//     var master_stream = try std.net.tcpConnectToHost(allocator, state.replicaof.?.master_host, state.replicaof.?.master_port);
-//     defer master_stream.close();
+pub fn sendSyncHandshakeToMaster(allocator: std.mem.Allocator, state: *ServerState) !RdbFile {
+    // Connect to master and ask it to sync. This blocks (does not listen to incoming connections) until finished.
+    if (state.replicaof == null) return Error.BadConfiguration;
+    var master_stream = (try std.net.tcpConnectToHost(allocator, state.replicaof.?.master_host, state.replicaof.?.master_port));
+    defer master_stream.close();
+    const master_socket = master_stream.handle;
 
-//     // Send a ping to master, expect a PONG back
-//     {
-//         const ping = Message{ .array = .{ .allocator = allocator, .elements = &[_]Message{.{ .bulk_string = .{ .value = "PING" } }} } };
-//         try master_stream.writeAll(try ping.toStr(allocator));
-//         var response_buffer = std.ArrayList(u8).init(allocator);
-//         defer response_buffer.deinit();
-//         const num_read_bytes = try network.readFromStream(master_stream, &response_buffer);
-//         if (num_read_bytes == 0) return Error.FailedSyncHandshake;
-//         var response = try Message.fromStr(allocator, response_buffer.items);
-//         defer response.deinit();
-//         switch (response) {
-//             .simple_string => |s| if (!std.ascii.eqlIgnoreCase(s.value, "pong")) return Error.FailedSyncHandshake,
-//             else => return Error.FailedSyncHandshake,
-//         }
-//     }
+    // Send a ping to master, expect a PONG back
+    {
+        const ping = Message{ .array = .{ .allocator = allocator, .elements = &[_]Message{.{ .bulk_string = .{ .value = "PING" } }} } };
+        const write_buffer = try ping.toStr(allocator);
+        defer allocator.free(write_buffer);
+        try network.writeToSocket(master_socket, write_buffer);
+        var response_buffer = std.ArrayList(u8).init(allocator);
+        defer response_buffer.deinit();
+        const num_read_bytes = try network.readFromSocket(master_socket, &response_buffer);
+        if (num_read_bytes == 0) return Error.FailedSyncHandshake;
+        var response = try Message.fromStr(allocator, response_buffer.items);
+        defer response.deinit();
+        switch (response) {
+            .simple_string => |s| if (!std.ascii.eqlIgnoreCase(s.value, "pong")) return Error.FailedSyncHandshake,
+            else => return Error.FailedSyncHandshake,
+        }
+    }
 
-//     // Send a REPLCONF to master twice, expecting OK back
-//     {
-//         // NOTE: it's fine to put this on the stack since its lifetime is as long as this function.
-//         var port_buf: [8]u8 = undefined;
-//         const len = std.fmt.formatIntBuf(&port_buf, state.port, 10, .lower, .{});
-//         const port = port_buf[0..len];
+    // Send a REPLCONF to master twice, expecting OK back
+    {
+        // NOTE: it's fine to put this on the stack since its lifetime is as long as this function.
+        var port_buf: [8]u8 = undefined;
+        const len = std.fmt.formatIntBuf(&port_buf, state.port, 10, .lower, .{});
+        const port = port_buf[0..len];
 
-//         {
-//             // Send first REPLCONF: REPLCONF listening-port <port>
-//             const msgs = [_]Message{ .{ .bulk_string = .{ .value = "REPLCONF" } }, .{ .bulk_string = .{ .value = "listening-port" } }, .{ .bulk_string = .{ .value = port } } };
-//             const first_replconf = Message{ .array = .{ .allocator = allocator, .elements = &msgs } };
-//             try master_stream.writeAll(try first_replconf.toStr(allocator));
-//             // Expect OK.
-//             var response_buffer = std.ArrayList(u8).init(allocator);
-//             defer response_buffer.deinit();
-//             const num_read_bytes = try network.readFromStream(master_stream, &response_buffer);
-//             if (num_read_bytes == 0) return Error.FailedSyncHandshake;
-//             var response = try Message.fromStr(allocator, response_buffer.items);
-//             defer response.deinit();
-//             switch (response) {
-//                 .simple_string => |s| if (!std.ascii.eqlIgnoreCase(s.value, "OK")) return Error.FailedSyncHandshake,
-//                 else => return Error.FailedSyncHandshake,
-//             }
-//         }
-//         {
-//             // Send second REPLCONF: REPLCONF capa psync2
-//             const msgs = [_]Message{ .{ .bulk_string = .{ .value = "REPLCONF" } }, .{ .bulk_string = .{ .value = "capa" } }, .{ .bulk_string = .{ .value = "psync2" } } };
-//             const first_replconf = Message{ .array = .{ .elements = &msgs } };
-//             try master_stream.writeAll(try first_replconf.toStr(allocator));
-//             // Expect OK.
-//             var response_buffer = std.ArrayList(u8).init(allocator);
-//             defer response_buffer.deinit();
-//             const num_read_bytes = try network.readFromStream(master_stream, &response_buffer);
-//             if (num_read_bytes == 0) return Error.FailedSyncHandshake;
-//             var response = try Message.fromStr(allocator, response_buffer.items);
-//             defer response.deinit();
-//             switch (response) {
-//                 .simple_string => |s| if (!std.ascii.eqlIgnoreCase(s.value, "OK")) return Error.FailedSyncHandshake,
-//                 else => return Error.FailedSyncHandshake,
-//             }
-//         }
-//         {
-//             // TODO send a PSYNC to master, expecting FULLRESYNC back
-//             // Send PSYNC: PSYNC ? -1
-//             const msgs = [_]Message{ .{ .bulk_string = .{ .value = "PSYNC" } }, .{ .bulk_string = .{ .value = "?" } }, .{ .bulk_string = .{ .value = "-1" } } };
-//             const psync = Message{ .array = .{ .elements = &msgs } };
-//             try master_stream.writeAll(try psync.toStr(allocator));
-//             // Expect OK.
-//             var response_buffer = std.ArrayList(u8).init(allocator);
-//             defer response_buffer.deinit();
-//             const num_read_bytes = try network.readFromStream(master_stream, &response_buffer);
-//             if (num_read_bytes == 0) return Error.FailedSyncHandshake;
-//             // TODO ignore the response for now, handle later.
-//         }
-//     }
+        {
+            // Send first REPLCONF: REPLCONF listening-port <port>
+            const msgs = [_]Message{ .{ .bulk_string = .{ .value = "REPLCONF" } }, .{ .bulk_string = .{ .value = "listening-port" } }, .{ .bulk_string = .{ .value = port } } };
+            const first_replconf = Message{ .array = .{ .allocator = allocator, .elements = &msgs } };
+            const write_buffer = try first_replconf.toStr(allocator);
+            defer allocator.free(write_buffer);
+            try network.writeToSocket(master_socket, write_buffer);
+            // Expect OK.
+            var response_buffer = std.ArrayList(u8).init(allocator);
+            defer response_buffer.deinit();
+            const num_read_bytes = try network.readFromSocket(master_socket, &response_buffer);
+            if (num_read_bytes == 0) return Error.FailedSyncHandshake;
+            var response = try Message.fromStr(allocator, response_buffer.items);
+            defer response.deinit();
+            switch (response) {
+                .simple_string => |s| if (!std.ascii.eqlIgnoreCase(s.value, "OK")) return Error.FailedSyncHandshake,
+                else => return Error.FailedSyncHandshake,
+            }
+        }
+        {
+            // Send second REPLCONF: REPLCONF capa psync2
+            const msgs = [_]Message{ .{ .bulk_string = .{ .value = "REPLCONF" } }, .{ .bulk_string = .{ .value = "capa" } }, .{ .bulk_string = .{ .value = "psync2" } } };
+            const second_replconf = Message{ .array = .{ .elements = &msgs } };
+            const write_buffer = try second_replconf.toStr(allocator);
+            defer allocator.free(write_buffer);
+            try network.writeToSocket(master_socket, write_buffer);
+            // Expect OK.
+            var response_buffer = std.ArrayList(u8).init(allocator);
+            defer response_buffer.deinit();
+            const num_read_bytes = try network.readFromSocket(master_socket, &response_buffer);
+            if (num_read_bytes == 0) return Error.FailedSyncHandshake;
+            var response = try Message.fromStr(allocator, response_buffer.items);
+            defer response.deinit();
+            switch (response) {
+                .simple_string => |s| if (!std.ascii.eqlIgnoreCase(s.value, "OK")) return Error.FailedSyncHandshake,
+                else => return Error.FailedSyncHandshake,
+            }
+        }
+        {
+            // TODO send a PSYNC to master, expecting FULLRESYNC back
+            // Send PSYNC: PSYNC ? -1
+            const msgs = [_]Message{ .{ .bulk_string = .{ .value = "PSYNC" } }, .{ .bulk_string = .{ .value = "?" } }, .{ .bulk_string = .{ .value = "-1" } } };
+            const psync = Message{ .array = .{ .elements = &msgs } };
+            const write_buffer = try psync.toStr(allocator);
+            defer allocator.free(write_buffer);
+            try network.writeToSocket(master_socket, write_buffer);
+            // Expect OK.
+            var response_buffer = std.ArrayList(u8).init(allocator);
+            defer response_buffer.deinit();
+            const num_read_bytes = try network.readFromSocket(master_socket, &response_buffer);
+            if (num_read_bytes == 0) return Error.FailedSyncHandshake;
+            // TODO ignore the response for now, handle later.
+        }
+    }
 
-//     // TODO expect master to send us an RDB file
-//     return .{};
-// }
+    // TODO expect master to send us an RDB file
+    return .{};
+}

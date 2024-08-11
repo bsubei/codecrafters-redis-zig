@@ -41,12 +41,12 @@ pub fn readChunk(socket: posix.socket_t, message_ptr: *std.ArrayList(u8)) !usize
     return num_read_bytes;
 }
 
-pub fn writeToSocket(socket: posix.socket_t, data: []const u8) !usize {
+pub fn writeToSocket(socket: posix.socket_t, data: []const u8) !void {
     var total_written: usize = 0;
     while (total_written < data.len) {
         const written = try posix.write(socket, data[total_written..]);
         if (written == 0) return error.WriteZero;
         total_written += written;
     }
-    return total_written;
+    if (total_written > data.len) return error.WroteTooMuch;
 }

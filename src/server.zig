@@ -173,7 +173,10 @@ fn recvCallback(
     const allocator = connection.server_state.allocator;
 
     const read_len = result.recv catch |err| {
-        std.debug.print("ERROR reading from socket: {s}\n", .{@errorName(err)});
+        switch (err) {
+            error.EOF => std.debug.print("socket closed from client side: {}\n", .{connection.socket_fd}),
+            else => std.debug.print("ERROR reading from socket: {s}\n", .{@errorName(err)}),
+        }
         connection.close(loop, closeCallback);
         return .disarm;
     };
@@ -264,13 +267,11 @@ fn loadRdbFile(rdb_file: parser.RdbFile, state: *ServerState) !void {
     _ = state;
 }
 fn syncWithMaster(allocator: std.mem.Allocator, state: *ServerState) !void {
-    _ = allocator;
-    _ = state;
     // Send full sync handshake to master
-    // const rdb_file = try parser.sendSyncHandshakeToMaster(allocator, state);
+    const rdb_file = try parser.sendSyncHandshakeToMaster(allocator, state);
 
     // Take the parsed RDB that master sent and use it to update our state.
-    // try loadRdbFile(rdb_file, state);
+    try loadRdbFile(rdb_file, state);
 }
 /// Set up a listener at this address, and arm the accept event to handle incoming connections.
 fn listenForConnections(address: net.Address, state: *ServerState) !void {
