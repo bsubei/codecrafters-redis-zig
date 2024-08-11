@@ -12,7 +12,7 @@ const xev = @import("xev");
 pub const ServerState = struct {
     const Self = @This();
     const PortType = u16;
-    const ReplicaMap = std.HashMap(net.Address, ReplicaState, AddressContext, std.hash_map.default_max_load_percentage);
+    const ReplicaMap = std.AutoHashMap(posix.socket_t, ReplicaState);
     const DEFAULT_PORT = 6379;
 
     allocator: std.mem.Allocator,
@@ -27,6 +27,8 @@ pub const ServerState = struct {
     accept_completion: ?*xev.Completion = null,
 
     port: PortType,
+    /// TODO need to store the connection to master so we treat them differently (e.g. don't reply to their write commands)
+    /// Will be set if this server is a replica. Will be null if the server is a master.
     replicaof: ?ReplicaOf,
 
     const Error = error{
@@ -164,57 +166,6 @@ pub const ServerState = struct {
     }
 
     // TODO test createConfig
-
-    pub const AddressContext = struct {
-        pub fn hash(_: @This(), address: net.Address) u64 {
-            switch (address.any.family) {
-                posix.AF.INET => {
-                    const ip4 = address.in;
-                    return @as(u64, ip4.sa.port) << 32 | ip4.sa.addr;
-                },
-                posix.AF.INET6 => {
-                    const ip6 = address.in6;
-                    var hasher = std.hash.Wyhash.init(0);
-                    std.hash.autoHash(&hasher, ip6.sa.addr);
-                    std.hash.autoHash(&hasher, ip6.sa.port);
-                    std.hash.autoHash(&hasher, ip6.sa.flowinfo);
-                    std.hash.autoHash(&hasher, ip6.sa.scope_id);
-                    return hasher.final();
-                },
-                posix.AF.UNIX => {
-                    if (!@hasField(std.net.Address, "un")) {
-                        @compileError("Unix sockets are not supported on this platform");
-                    }
-                    var hasher = std.hash.Wyhash.init(0);
-                    std.hash.autoHash(&hasher, address.un.path);
-                    return hasher.final();
-                },
-                else => @panic("Unsupported address family"),
-            }
-        }
-        pub fn eql(_: @This(), a: std.net.Address, b: std.net.Address) bool {
-            if (a.any.family != b.any.family) return false;
-
-            switch (a.any.family) {
-                posix.AF.INET => {
-                    return a.in.sa.port == b.in.sa.port and a.in.sa.addr == b.in.sa.addr;
-                },
-                posix.AF.INET6 => {
-                    return a.in6.sa.port == b.in6.sa.port and
-                        std.mem.eql(u8, &a.in6.sa.addr, &b.in6.sa.addr) and
-                        a.in6.sa.flowinfo == b.in6.sa.flowinfo and
-                        a.in6.sa.scope_id == b.in6.sa.scope_id;
-                },
-                posix.AF.UNIX => {
-                    if (!@hasField(std.net.Address, "un")) {
-                        @compileError("Unix sockets are not supported on this platform");
-                    }
-                    return std.mem.eql(u8, &a.un.path, &b.un.path);
-                },
-                else => @panic("Unsupported address family"),
-            }
-        }
-    };
 
     /// Returns the ReplicaStates that match the given type.
     pub fn getReplicaStatesByType(self: *Self, allocator: std.mem.Allocator, replica_type: ReplicaStateType) ![]const ReplicaState {

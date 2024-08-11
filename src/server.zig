@@ -195,14 +195,17 @@ fn recvCallback(
     defer request.deinit();
 
     // Handle the Request (update state) and generate a Response as a string.
-    const response_str = parser.handleRequest(allocator, request, connection.server_state) catch |err| {
+    const response_str = parser.handleRequest(allocator, request, connection) catch |err| {
         std.debug.print("ERROR handling request: {s}\n", .{@errorName(err)});
         connection.close(loop, closeCallback);
         return .disarm;
     };
-    // const response_str = "+PONG\r\n";
     std.debug.print("request -> response:\n{s},{s}\n", .{ raw_message, response_str });
     defer allocator.free(response_str);
+
+    // TODO if we're a replica, don't set up a send if the sender is master.
+
+    // TODO if we're master, set up a send event for replicas (if this is a write command)
 
     // Send the Response back to the client by setting up a send event.
     connection.send(loop, sendCallback, response_str) catch |err| {
@@ -235,6 +238,38 @@ fn sendCallback(
         .{ send.fd, send_len, send.buffer.slice[0..send_len] },
     );
 
+    // If we're master, send the RDB file to conclude the full synchronization if the connection is ready.
+    const server_state = connection.server_state;
+    const allocator = server_state.allocator;
+    if (connection.server_state.replicaof == null) {
+        if (server_state.replicaStatesByAddress.get(connection.socket_fd)) |replica_state| {
+            switch (replica_state) {
+                .receiving_sync => |r_state| {
+                    const rdb_file = rdb.getEmptyRdb(allocator) catch |err| {
+                        std.debug.print("ERROR getting RDB file to send to replica {d}: {s}\n", .{ connection.socket_fd, @errorName(err) });
+                        return .disarm;
+                    };
+                    defer allocator.free(rdb_file);
+                    const msg = std.fmt.allocPrint(allocator, "${d}\r\n{s}", .{ rdb_file.len, rdb_file }) catch |err| {
+                        std.debug.print("ERROR formatting RDB output for socket {d}: {s}\n", .{ connection.socket_fd, @errorName(err) });
+                        return .disarm;
+                    };
+                    defer allocator.free(msg);
+                    server_state.replicaStatesByAddress.put(connection.socket_fd, .{ .connected_replica = .{ .capa = r_state.capa, .listening_port = r_state.listening_port } }) catch |err| {
+                        std.debug.print("ERROR putting replica state for socket {d}: {s}\n", .{ connection.socket_fd, @errorName(err) });
+                        return .disarm;
+                    };
+                    connection.send(loop, sendCallback, msg) catch |err| {
+                        std.debug.print("ERROR creating send event for socket {d}: {s}\n", .{ connection.socket_fd, @errorName(err) });
+                        return .disarm;
+                    };
+                    return .disarm;
+                },
+                else => {},
+            }
+        }
+    }
+
     // We're done with sending. However, let's set up recv again in case there's more messages.
     connection.recv(loop, recvCallback);
     return .disarm;
@@ -249,16 +284,6 @@ fn closeCallback(
     const connection = @as(*Connection, @ptrCast(@alignCast(ud.?)));
     connection.deinit();
     return .disarm;
-}
-fn sendReplicaUpdates(allocator: std.mem.Allocator, state: *ServerState) !void {
-    // For now, just take care of sending the RDB file for all replicas waiting for it.
-    const replicas = try state.getReplicaStatesByType(allocator, ServerState.ReplicaStateType.receiving_sync);
-    defer allocator.free(replicas);
-    const rdb_data = try rdb.getEmptyRdb(allocator);
-    defer allocator.free(rdb_data);
-    // TODO write to each replica
-
-    // TODO later, relay all writes to replicas (maybe not here, actually).
 }
 
 fn loadRdbFile(rdb_file: parser.RdbFile, state: *ServerState) !void {
