@@ -534,8 +534,11 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
                 switch (messages.len) {
                     3 => {
                         const replicationid = try messages[1].get_contents();
+                        const replicationidCopy = try allocator.alloc(u8, replicationid.len);
+                        errdefer allocator.free(replicationidCopy);
+                        std.mem.copyForwards(u8, replicationidCopy, replicationid);
                         const offset = try std.fmt.parseInt(i64, try messages[2].get_contents(), 10);
-                        return .{ .command = .{ .psync = .{ .replicationid = replicationid, .offset = offset } }, .allocator = allocator };
+                        return .{ .command = .{ .psync = .{ .replicationid = replicationidCopy, .offset = offset } }, .allocator = allocator };
                     },
                     else => return Error.InvalidRequestNumberOfArgs,
                 }
