@@ -1,0 +1,6 @@
+inputs:
+  nixpkgs:
+    url: github:NixOS/nixpkgs/nixpkgs-unstable
+  zig-overlay:
+    url: github:mitchellh/zig-overlay
+

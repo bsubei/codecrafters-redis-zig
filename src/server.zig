@@ -1,6 +1,6 @@
 const std = @import("std");
 const net = std.net;
-const stdout = std.io.getStdOut().writer();
+const stdout = std.fs.File.stdout().deprecatedWriter();
 const testing = std.testing;
 const Cache = @import("Cache.zig");
 const parser = @import("parser.zig");
@@ -328,7 +328,7 @@ fn listenForConnections(address: net.Address, state: *ServerState) !void {
         .kernel_backlog = 128,
     });
     defer listener.deinit();
-    try stdout.print("Started listening at address: {}\n", .{address.in});
+    try stdout.print("Started listening at address: {any}\n", .{address.in});
 
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();

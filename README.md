@@ -3,8 +3,7 @@ This is a WIP Zig solution to the ["Build Your Own Redis" Challenge](https://cod
 
 # Requirements
 
-- zig 0.12
-- Run `git submodule update --init --recursive --remote --force` to get the `libxev` dependency checked out to the right commit.
+- zig 0.15.2
 
 # TODOs
 

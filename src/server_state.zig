@@ -122,9 +122,7 @@ pub const ServerState = struct {
         var bytes: [20]u8 = undefined;
         var rand = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
         rand.fill(&bytes);
-        var buf: [40]u8 = undefined;
-        _ = try std.fmt.bufPrint(&buf, "{s}", .{std.fmt.fmtSliceHexLower(&bytes)});
-        return buf;
+        return std.fmt.bytesToHex(&bytes, .lower);
     }
 
     fn createInfoSections(replicaof: ?ReplicaOf) !InfoSections {
@@ -140,16 +138,16 @@ pub const ServerState = struct {
     // TODO test createConfig
 
     pub fn getReplicaConnectionsByType(self: *Self, allocator: std.mem.Allocator, replica_type: ReplicaStateType) ![]const *Connection {
-        var buf = std.ArrayList(*Connection).init(allocator);
-        errdefer buf.deinit();
+        var buf = std.ArrayList(*Connection).empty;
+        errdefer buf.deinit(allocator);
 
         var it = self.connectionsMap.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.*.replica_state) |r_state| if (@as(ReplicaStateType, r_state) == replica_type) {
-                try buf.append(entry.value_ptr.*);
+                try buf.append(allocator, entry.value_ptr.*);
             };
         }
 
-        return buf.toOwnedSlice();
+        return buf.toOwnedSlice(allocator);
     }
 };

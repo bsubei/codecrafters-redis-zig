@@ -50,7 +50,7 @@ pub fn putWithExpiry(self: *Self, key: K, value: V, expiry: ExpiryTimestampMs) !
         // Make a copy of the key, and insert the kv into the map.
         const owned_key = try self.map.allocator.dupe(u8, key);
         errdefer self.map.allocator.free(owned_key);
-        const new_entry = .{ .value = owned_value, .expiry_timestamp_ms = expiry };
+        const new_entry = ValueTimestampPair{ .value = owned_value, .expiry_timestamp_ms = expiry };
         try self.map.putNoClobber(owned_key, new_entry);
     }
 }

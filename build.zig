@@ -7,9 +7,11 @@ pub fn build(b: *std.Build) void {
 
     const exe = b.addExecutable(.{
         .name = "zig",
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
 
     const libxev_dep = b.dependency("libxev", .{
@@ -50,8 +52,10 @@ pub fn build(b: *std.Build) void {
     while (walker.next() catch unreachable) |entry| {
         if (entry.kind == .file and std.mem.endsWith(u8, entry.path, ".zig")) {
             const test_artifact = b.addTest(.{
-                .root_source_file = .{ .path = b.pathJoin(&.{ "src", entry.path }) },
-                .target = target,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path(b.pathJoin(&.{ "src", entry.path })),
+                    .target = target,
+                }),
             });
             test_step.dependOn(&b.addRunArtifact(test_artifact).step);
         }

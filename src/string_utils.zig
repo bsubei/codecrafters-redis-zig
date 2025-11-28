@@ -12,7 +12,7 @@ const testing = std.testing;
 /// TODO consider using std.fmt.formatType or something else to reduce the amount of code here. Also to support optional enums and arbitrary types.
 pub fn appendNameValue(allocator: std.mem.Allocator, comptime field_type: type, field_name: []const u8, field_value: anytype, input_string: []const u8) ![]const u8 {
     // Skip any optional fields that are not activated.
-    if (@typeInfo(field_type) != .Optional or field_value != null) {
+    if (@typeInfo(field_type) != .optional or field_value != null) {
         defer allocator.free(input_string);
 
         // The formatter string depends on the field_type, i.e. {s} for strings and {d} for decimals etc.
@@ -28,7 +28,7 @@ pub fn appendNameValue(allocator: std.mem.Allocator, comptime field_type: type, 
 /// handle Enums, Optionals, Numbers, and Strings (as slices, pointers, or arrays).
 fn allocPrintNameValue(allocator: std.mem.Allocator, comptime field_type: type, field_name: []const u8, field_value: anytype) ![]const u8 {
     switch (@typeInfo(field_type)) {
-        .Enum => {
+        .@"enum" => {
             return try std.fmt.allocPrint(allocator, "{s}:{s}\n", .{ field_name, @tagName(field_value) });
         },
         else => {
@@ -40,13 +40,13 @@ fn allocPrintNameValue(allocator: std.mem.Allocator, comptime field_type: type, 
 
 fn isStringType(comptime field: type) bool {
     switch (@typeInfo(field)) {
-        .Array => |info| {
+        .array => |info| {
             if (info.child == u8) {
                 return true;
             }
         },
-        .Pointer => |info| {
-            if ((info.size == .Slice or info.size == .Many) and info.child == u8) {
+        .pointer => |info| {
+            if ((info.size == .slice or info.size == .many) and info.child == u8) {
                 return true;
             }
         },
@@ -55,8 +55,8 @@ fn isStringType(comptime field: type) bool {
 }
 
 fn getFormatterString(comptime T: type) []const u8 {
-    const is_optional = @typeInfo(T) == .Optional;
-    const underlying_type = if (is_optional) @typeInfo(T).Optional.child else T;
+    const is_optional = @typeInfo(T) == .optional;
+    const underlying_type = if (is_optional) @typeInfo(T).optional.child else T;
 
     if (isStringType(underlying_type)) {
         return if (is_optional) "{s}:{?s}\n" else "{s}:{s}\n";

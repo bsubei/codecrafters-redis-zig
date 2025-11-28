@@ -16,3 +16,6 @@ bin/
 **/.DS_Store
 *.swp
 *~
+
+devenv.lock
+.devenv*

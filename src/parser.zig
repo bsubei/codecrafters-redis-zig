@@ -341,8 +341,8 @@ test "Message toStr BulkString" {
 }
 test "Message toStr Array" {
     {
-        const first = .{ .bulk_string = .{ .value = "first" } };
-        const last = .{ .simple_string = .{ .value = "last" } };
+        const first = Message{ .bulk_string = .{ .value = "first" } };
+        const last = Message{ .simple_string = .{ .value = "last" } };
         const message = Message{ .array = .{ .elements = &[_]Message{ first, last }, .allocator = testing.allocator } };
         const msg_str = try message.toStr(testing.allocator);
         defer testing.allocator.free(msg_str);
@@ -364,8 +364,8 @@ test "Message roundtrip BulkString" {
     try testing.expectEqualSlices(u8, msg.bulk_string.value, msg_again.bulk_string.value);
 }
 test "Message roundtrip Array" {
-    const first = .{ .bulk_string = .{ .value = "first" } };
-    const last = .{ .simple_string = .{ .value = "last" } };
+    const first = Message{ .bulk_string = .{ .value = "first" } };
+    const last = Message{ .simple_string = .{ .value = "last" } };
     const msg = Message{ .array = .{ .elements = &[_]Message{ first, last }, .allocator = testing.allocator } };
     const msg_str = try msg.toStr(testing.allocator);
     defer testing.allocator.free(msg_str);
@@ -519,8 +519,8 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
                 // TODO we should dedupe any given section keys.
                 // Just copy over all the remaining message contents to the arguments, and pass on ownership to the caller.
                 var list_str = try messagesToArrayList(allocator, messages[1..]);
-                errdefer list_str.deinit();
-                return .{ .command = .{ .info = .{ .arguments = try list_str.toOwnedSlice() } }, .allocator = allocator };
+                errdefer list_str.deinit(allocator);
+                return .{ .command = .{ .info = .{ .arguments = try list_str.toOwnedSlice(allocator) } }, .allocator = allocator };
             }
             if (std.ascii.eqlIgnoreCase(first_word, "replconf")) {
                 switch (messages.len) {
@@ -528,8 +528,8 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
                     else => {
                         // Just copy over all the remaining message contents to the arguments, and pass on ownership to the caller.
                         var list_str = try messagesToArrayList(allocator, messages[1..]);
-                        errdefer list_str.deinit();
-                        return .{ .command = .{ .replconf = .{ .arguments = try list_str.toOwnedSlice() } }, .allocator = allocator };
+                        errdefer list_str.deinit(allocator);
+                        return .{ .command = .{ .replconf = .{ .arguments = try list_str.toOwnedSlice(allocator) } }, .allocator = allocator };
                     },
                 }
             }
@@ -558,10 +558,10 @@ fn messageToRequest(allocator: std.mem.Allocator, message: Message) !Request {
 /// The caller is responsible for calling deinit() on the ArrayList.
 fn messagesToArrayList(allocator: std.mem.Allocator, messages: []const Message) !std.ArrayList([]const u8) {
     // This seems like a bunch of unnecessary allocating, but it's ok since we're using an arena allocator backed by a page allocator.
-    var temp_list = std.ArrayList([]const u8).init(allocator);
-    errdefer temp_list.deinit();
+    var temp_list = std.ArrayList([]const u8).empty;
+    errdefer temp_list.deinit(allocator);
     for (messages) |msg| {
-        try temp_list.append(try allocator.dupe(u8, try msg.get_contents()));
+        try temp_list.append(allocator, try allocator.dupe(u8, try msg.get_contents()));
     }
     return temp_list;
 }
@@ -663,11 +663,11 @@ fn handleRequestAndGenerateResponseMessage(allocator: std.mem.Allocator, request
             for (i.arguments) |section_key| {
                 // TODO for now we just ignore unknown section keys.
                 // Find the section in InfoSections that matches the section_key (e.g. "replication").
-                inline for (@typeInfo(@TypeOf(state.info_sections)).Struct.fields) |section| {
+                inline for (@typeInfo(@TypeOf(state.info_sections)).@"struct".fields) |section| {
                     if (std.ascii.eqlIgnoreCase(section.name, section_key)) {
                         // Now, take that config section (e.g. ReplicationConfig) and concatenate all its fields as name:value strings.
                         const config_section = @field(state.info_sections, section.name);
-                        inline for (@typeInfo(@TypeOf(config_section)).Struct.fields) |section_field| {
+                        inline for (@typeInfo(@TypeOf(config_section)).@"struct".fields) |section_field| {
                             const field_value = @field(config_section, section_field.name);
                             concatenated = try string_utils.appendNameValue(allocator, section_field.type, section_field.name, field_value, concatenated);
                         }
@@ -770,9 +770,9 @@ pub fn sendSyncHandshakeToMaster(allocator: std.mem.Allocator, state: *ServerSta
         const write_buffer = try ping.toStr(allocator);
         defer allocator.free(write_buffer);
         try network.writeToSocket(master_socket, write_buffer);
-        var response_buffer = std.ArrayList(u8).init(allocator);
-        defer response_buffer.deinit();
-        const num_read_bytes = try network.readFromSocket(master_socket, &response_buffer);
+        var response_buffer = std.ArrayList(u8).empty;
+        defer response_buffer.deinit(allocator);
+        const num_read_bytes = try network.readFromSocket(allocator, master_socket, &response_buffer);
         if (num_read_bytes == 0) return Error.FailedSyncHandshake;
         var response = try Message.fromStr(allocator, response_buffer.items);
         defer response.deinit();
@@ -786,8 +786,11 @@ pub fn sendSyncHandshakeToMaster(allocator: std.mem.Allocator, state: *ServerSta
     {
         // NOTE: it's fine to put this on the stack since its lifetime is as long as this function.
         var port_buf: [8]u8 = undefined;
-        const len = std.fmt.formatIntBuf(&port_buf, state.port, 10, .lower, .{});
-        const port = port_buf[0..len];
+        // const len = std.fmt.formatIntBuf(&port_buf, state.port, 10, .lower, .{});
+        // const port = port_buf[0..len];
+        var writer = std.io.Writer.fixed(&port_buf);
+        try writer.printInt(state.port, 10, .lower, .{});
+        const port = &port_buf;
 
         {
             // Send first REPLCONF: REPLCONF listening-port <port>
@@ -797,9 +800,9 @@ pub fn sendSyncHandshakeToMaster(allocator: std.mem.Allocator, state: *ServerSta
             defer allocator.free(write_buffer);
             try network.writeToSocket(master_socket, write_buffer);
             // Expect OK.
-            var response_buffer = std.ArrayList(u8).init(allocator);
-            defer response_buffer.deinit();
-            const num_read_bytes = try network.readFromSocket(master_socket, &response_buffer);
+            var response_buffer = std.ArrayList(u8).empty;
+            defer response_buffer.deinit(allocator);
+            const num_read_bytes = try network.readFromSocket(allocator, master_socket, &response_buffer);
             if (num_read_bytes == 0) return Error.FailedSyncHandshake;
             var response = try Message.fromStr(allocator, response_buffer.items);
             defer response.deinit();
@@ -816,9 +819,9 @@ pub fn sendSyncHandshakeToMaster(allocator: std.mem.Allocator, state: *ServerSta
             defer allocator.free(write_buffer);
             try network.writeToSocket(master_socket, write_buffer);
             // Expect OK.
-            var response_buffer = std.ArrayList(u8).init(allocator);
-            defer response_buffer.deinit();
-            const num_read_bytes = try network.readFromSocket(master_socket, &response_buffer);
+            var response_buffer = std.ArrayList(u8).empty;
+            defer response_buffer.deinit(allocator);
+            const num_read_bytes = try network.readFromSocket(allocator, master_socket, &response_buffer);
             if (num_read_bytes == 0) return Error.FailedSyncHandshake;
             var response = try Message.fromStr(allocator, response_buffer.items);
             defer response.deinit();
@@ -835,9 +838,9 @@ pub fn sendSyncHandshakeToMaster(allocator: std.mem.Allocator, state: *ServerSta
             defer allocator.free(write_buffer);
             try network.writeToSocket(master_socket, write_buffer);
             // Expect OK.
-            var response_buffer = std.ArrayList(u8).init(allocator);
-            defer response_buffer.deinit();
-            const num_read_bytes = try network.readFromSocket(master_socket, &response_buffer);
+            var response_buffer = std.ArrayList(u8).empty;
+            defer response_buffer.deinit(allocator);
+            const num_read_bytes = try network.readFromSocket(allocator, master_socket, &response_buffer);
             if (num_read_bytes == 0) return Error.FailedSyncHandshake;
             // TODO ignore the response for now, handle later when we can actually read/write RDB files. Right now, assume empty RDB.
         }
